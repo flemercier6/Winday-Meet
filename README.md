@@ -112,7 +112,9 @@ Works in **Chrome**, **Dia** and **Arc**. The panel has two display modes
    (headline, next steps, context, sections), the next‑step checkboxes stay
    ticked, and a diarized **Participant N** can be renamed (from the
    transcript label or the owner menu) — the whole transcript and the next
-   steps follow. Everything is saved with the meeting, on every device.
+   steps follow. Any name can be removed from the owner menu (✕); a first
+   name and its full-name twin show once. Everything is saved with the
+   meeting, on every device.
 
 ### Which company was that call with?
 

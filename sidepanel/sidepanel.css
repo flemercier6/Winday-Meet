@@ -291,9 +291,11 @@ button:disabled { opacity: 0.5; cursor: default; }
 /* A diarized "Participant N" row: the name button + a rename (pencil) button. */
 .owner-menu .opt { display: flex; align-items: center; gap: 2px; }
 .owner-menu .opt > button:first-child { flex: 1; }
-.owner-menu .opt .rename { flex: none; padding: 5px; color: var(--text-muted); opacity: 0; }
-.owner-menu .opt:hover .rename, .owner-menu .opt .rename:focus-visible { opacity: 1; }
+.owner-menu .opt .rename, .owner-menu .opt .remove { flex: none; padding: 5px; color: var(--text-muted); opacity: 0; }
+.owner-menu .opt:hover .rename, .owner-menu .opt .rename:focus-visible,
+.owner-menu .opt:hover .remove, .owner-menu .opt .remove:focus-visible { opacity: 1; }
 .owner-menu .opt .rename:hover { color: var(--text-primary); }
+.owner-menu .opt .remove:hover { color: var(--danger); }
 .owner-menu .opt input { flex: 1; margin: 0; }
 .owner-menu input {
   margin-top: 3px; font: inherit; font-size: 12px; line-height: 16px; padding: 5px 8px;

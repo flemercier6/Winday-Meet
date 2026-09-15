@@ -613,11 +613,13 @@ function ownerCandidates(m, summary) {
     : null;
   const user = (userStep && userStep.owner) || emailName || "You";
 
+  // Names the user removed from this list (saved with the summary).
+  const hidden = new Set((summary.hidden_owners || []).map((n) => String(n).toLowerCase()));
   const seen = new Set([user.toLowerCase(), "you", "participant"]); // no generic placeholder
   const others = [];
   const add = (name) => {
     const n = String(name || "").trim();
-    if (!n || seen.has(n.toLowerCase())) return;
+    if (!n || seen.has(n.toLowerCase()) || hidden.has(n.toLowerCase())) return;
     seen.add(n.toLowerCase());
     others.push(n);
   };
@@ -626,7 +628,23 @@ function ownerCandidates(m, summary) {
     if (u.speaker !== "You") add(u.speaker);
   }
   for (const p of m.participants || []) if (p && !p.is_self) add(p.name);
-  return { user, others };
+  // One entry per person: the summary labels owners by first name, the
+  // attendee list by full name — "Matthieu" and "Matthieu Bagur" are the
+  // same person, and the first name is the one the steps use.
+  const firsts = new Set(others.filter((n) => !/\s/.test(n)).map((n) => n.toLowerCase()));
+  const deduped = others.filter((n) => {
+    const first = n.split(/\s+/)[0].toLowerCase();
+    return !(/\s/.test(n) && firsts.has(first));
+  });
+  return { user, others: deduped };
+}
+
+/** Drops a name from the owner list for good (it stays in the transcript). */
+function hideOwner(m, summary, name) {
+  const list = Array.isArray(summary.hidden_owners) ? summary.hidden_owners : [];
+  if (!list.some((n) => String(n).toLowerCase() === name.toLowerCase())) list.push(name);
+  summary.hidden_owners = list;
+  persistSummaryEdit(m);
 }
 
 function openOwnerMenu(pillEl, m, summary, ns) {
@@ -651,10 +669,21 @@ function openOwnerMenu(pillEl, m, summary, ns) {
       closeMenu();
       applyOwner(m, ns, label, isUser);
     });
-    if (!isUser && isDiarized(label)) {
-      // "Participant N" is a voice, not a person: rename it here (the whole
-      // transcript follows) and this step goes to the renamed person.
+    if (!isUser) {
+      // Every other name can be removed from this list (✕); a diarized
+      // "Participant N" is a voice, not a person, so it can also be renamed
+      // (the whole transcript follows) — this step then goes to that person.
       const row = div("opt");
+      const remove = iconBtn("cancel", `Remove ${label} from this list`, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        hideOwner(m, summary, label);
+        closeMenu();
+        openOwnerMenu(pillEl, m, summary, ns); // rebuilt without it
+      });
+      remove.classList.add("remove");
+      row.append(b);
+      if (!isDiarized(label)) { row.append(remove); menu.append(row); return; }
       const pencil = iconBtn("edit", `Rename ${label}`, (e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -679,7 +708,7 @@ function openOwnerMenu(pillEl, m, summary, ns) {
         input.focus();
       });
       pencil.classList.add("rename");
-      row.append(b, pencil);
+      row.append(pencil, remove);
       menu.append(row);
       return;
     }

@@ -31,6 +31,7 @@ let state = {
   notionURL: null,
   error: null,
   recorderHost: null, // "offscreen" | "panel" while recording
+  recordingTabId: null, // the Meet tab being captured, while recording
   imminentCall: null, // {title, meet_url, start} from the calendar, for the pill
   panelOpen: false, // a NATIVE side panel is open somewhere (pill hides itself)
 };
@@ -235,9 +236,9 @@ async function handle(msg, sender) {
       if (!tab) return { ok: false, error: "No Google Meet tab found — open your call, then try again." };
       try {
         const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id });
-        return await beginRecording({ streamId, title: msg.title || titleFromTab(tab), calendar: msg.calendar });
+        return await beginRecording({ streamId, title: msg.title || titleFromTab(tab), calendar: msg.calendar, tabId: tab.id });
       } catch (_) {
-        return { ok: false, needsPickerFallback: true, title: msg.title || titleFromTab(tab) };
+        return { ok: false, needsPickerFallback: true, title: msg.title || titleFromTab(tab), tabId: tab.id };
       }
     }
 
@@ -265,6 +266,7 @@ async function handle(msg, sender) {
 
     // The panel started a fallback (getDisplayMedia) recording in its iframe.
     case "WN_PANEL_REC_STARTED":
+      clearCallEndedTimer();
       await setState({
         phase: "recording",
         meetingId: msg.meeting?.id || null,
@@ -274,18 +276,12 @@ async function handle(msg, sender) {
         notionURL: null,
         error: null,
         recorderHost: "panel",
+        recordingTabId: sender?.tab?.id ?? null,
       });
       return { ok: true };
 
     case "WN_STOP":
-      if (state.phase === "recording") {
-        if (state.recorderHost === "panel") {
-          // The panel host may already be dead (closed mid-recording): recover
-          // from the journal instead of messaging into the void.
-          if (recorderPorts.size === 0) scheduleRecoveryCheck(1);
-          else chrome.runtime.sendMessage({ type: "WN_PANEL_STOP" }).catch(() => {});
-        } else await sendToOffscreen({ type: "STOP" });
-      }
+      await stopRecording();
       return { ok: true };
 
     case "WN_CANCEL":
@@ -293,11 +289,27 @@ async function handle(msg, sender) {
         if (state.recorderHost === "panel") chrome.runtime.sendMessage({ type: "WN_PANEL_CANCEL" }).catch(() => {});
         else await sendToOffscreen({ type: "CANCEL" });
       }
-      await setState({ phase: "idle", meetingId: null, stage: null, error: null, recorderHost: null });
+      clearCallEndedTimer();
+      await setState({ phase: "idle", meetingId: null, stage: null, error: null, recorderHost: null, recordingTabId: null });
       return { ok: true };
 
     case "WN_DISMISS":
-      await setState({ phase: "idle", stage: null, error: null, notionURL: null, recorderHost: null });
+      await setState({ phase: "idle", stage: null, error: null, notionURL: null, recorderHost: null, recordingTabId: null });
+      return { ok: true };
+
+    // --- call lifecycle, reported by the Meet content script ---
+    // The user left the call (Meet shows its "You left" screen) but the tab is
+    // still open: without this the recording would run until someone remembers
+    // to press Stop. A short grace period covers a flaky DOM read or a quick
+    // rejoin — WN_CALL_RESUMED from the same tab cancels the pending stop.
+    case "WN_CALL_ENDED":
+      if (state.phase === "recording" && sender?.tab?.id != null && sender.tab.id === state.recordingTabId) {
+        armCallEndedTimer();
+      }
+      return { ok: true };
+
+    case "WN_CALL_RESUMED":
+      if (sender?.tab?.id != null && sender.tab.id === state.recordingTabId) clearCallEndedTimer();
       return { ok: true };
 
     // --- recorder host -> background lifecycle events ---
@@ -305,28 +317,34 @@ async function handle(msg, sender) {
       return { ok: true };
 
     case "WN_REC_STAGE":
-      await setState({ phase: "processing", stage: msg.stage, recorderHost: null });
+      clearCallEndedTimer();
+      await setState({ phase: "processing", stage: msg.stage, recorderHost: null, recordingTabId: null });
       return { ok: true };
 
     case "WN_REC_DONE":
-      await setState({ phase: "done", stage: null, notionURL: msg.notionURL || null, error: null, recorderHost: null });
+      clearCallEndedTimer();
+      await setState({ phase: "done", stage: null, notionURL: msg.notionURL || null, error: null, recorderHost: null, recordingTabId: null });
       return { ok: true };
 
     case "WN_REC_FAILED":
-      await setState({ phase: "failed", stage: null, error: msg.error || "Processing failed.", recorderHost: null });
+      clearCallEndedTimer();
+      await setState({ phase: "failed", stage: null, error: msg.error || "Processing failed.", recorderHost: null, recordingTabId: null });
       return { ok: true };
 
     // --- Actions on past meetings (run in offscreen so they survive) ---
     case "WN_RETRY": {
       const session = await store.getSession();
       if (!session) return { ok: false, error: "Not available." };
-      let meeting = (await store.getMeetings()).find((m) => m.id === msg.id);
-      if (!meeting) {
-        // Synced meetings (recorded on another device, or aged out of the local
-        // cache) are retryable too — the server row carries transcript + audio.
-        sb.useSession(session, (s) => store.setSession(s), () => store.getSession());
-        meeting = await sb.getMeeting(msg.id).catch(() => null);
-      }
+      sb.useSession(session, (s) => store.setSession(s), () => store.getSession());
+      const local = (await store.getMeetings()).find((m) => m.id === msg.id) || null;
+      // The server row is the truth about what already succeeded. A pipeline
+      // can die AFTER the audio was uploaded and the transcript written (the
+      // transcription call errored on its way back), leaving a local copy
+      // that says "nothing was ever saved" — and a Retry that refused to run.
+      // Synced meetings (another device, aged out of the cache) come from the
+      // same row.
+      const remote = await sb.getMeeting(msg.id).catch(() => null);
+      const meeting = mergeForRetry(local, remote);
       if (!meeting) return { ok: false, error: "Not available." };
       await ensureOffscreen();
       await setState({ phase: "processing", meetingId: meeting.id, stage: null, error: null });
@@ -423,8 +441,26 @@ async function handle(msg, sender) {
   }
 }
 
+/** The local copy of a meeting, completed with whatever the server already
+ *  holds: audio path, transcript, summary. Local wins for the fields it has. */
+function mergeForRetry(local, remote) {
+  if (!local) return remote;
+  if (!remote) return local;
+  const hasUtts = (t) => !!(t && t.utterances && t.utterances.length);
+  return {
+    ...local,
+    audioPath: local.audioPath || remote.audioPath || null,
+    transcript: hasUtts(local.transcript) ? local.transcript
+      : hasUtts(remote.transcript) ? remote.transcript : (local.transcript || null),
+    summary: local.summary || remote.summary || null,
+    notionPageURL: local.notionPageURL || remote.notionPageURL || null,
+    participants: remote.participants || local.participants || null,
+    calendar: local.calendar || remote.calendar || null,
+  };
+}
+
 /** Starts an offscreen (silent-path) recording from a tabCapture stream id. */
-async function beginRecording({ streamId, title, calendar }) {
+async function beginRecording({ streamId, title, calendar, tabId }) {
   if (state.phase === "recording") return { ok: false, error: "Already recording." };
   const session = await store.getSession();
   if (!session) return { ok: false, error: "Sign in first." };
@@ -435,6 +471,7 @@ async function beginRecording({ streamId, title, calendar }) {
     startedAt: new Date().toISOString(),
     calendar: calendar || null,
   };
+  clearCallEndedTimer(); // a leftover grace timer must not end THIS recording
   await ensureOffscreen();
   await setState({
     phase: "recording",
@@ -445,10 +482,58 @@ async function beginRecording({ streamId, title, calendar }) {
     notionURL: null,
     error: null,
     recorderHost: "offscreen",
+    recordingTabId: tabId ?? null,
   });
   await sendToOffscreen({ type: "START", streamId, meeting, session, settings });
   return { ok: true, meetingId: meeting.id };
 }
+
+/** Stops the in-flight recording, whichever host holds it. */
+async function stopRecording() {
+  clearCallEndedTimer();
+  if (state.phase !== "recording") return;
+  if (state.recorderHost === "panel") {
+    // The panel host may already be dead (closed mid-recording): recover
+    // from the journal instead of messaging into the void.
+    if (recorderPorts.size === 0) scheduleRecoveryCheck(1);
+    else chrome.runtime.sendMessage({ type: "WN_PANEL_STOP" }).catch(() => {});
+  } else await sendToOffscreen({ type: "STOP" });
+}
+
+// --- Auto-stop: the call is over, so the recording is too -----------------
+// A recording used to outlive its call by hours whenever Stop was forgotten.
+// Three signals end it now:
+//   - the captured tab's audio track ends (tab closed) — handled inside the
+//     recorder itself (lib/capture.js);
+//   - the captured tab is closed or navigates away from the call — watched
+//     here through the tabs API;
+//   - the user leaves the call while the tab stays open — reported by the
+//     content script (WN_CALL_ENDED), applied after a short grace period held
+//     by an alarm so it survives a service-worker suspension.
+const CALL_ENDED_ALARM = "wn-call-ended";
+const CALL_ENDED_GRACE_MIN = 0.5;
+
+function armCallEndedTimer() {
+  chrome.alarms?.create(CALL_ENDED_ALARM, { delayInMinutes: CALL_ENDED_GRACE_MIN });
+}
+function clearCallEndedTimer() {
+  chrome.alarms?.clear(CALL_ENDED_ALARM).catch(() => {});
+}
+
+async function onRecordedTabGone(tabId) {
+  if (state.phase !== "recording" || tabId !== state.recordingTabId) return;
+  await stopRecording();
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => { onRecordedTabGone(tabId).catch(() => {}); });
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (!changeInfo.url) return;
+  if (state.phase !== "recording" || tabId !== state.recordingTabId) return;
+  // Still on the call (Meet keeps the meeting code in the URL after you leave,
+  // which the content script covers) — only a navigation elsewhere ends it here.
+  if (isCallTab(tab)) return;
+  onRecordedTabGone(tabId).catch(() => {});
+});
 
 // --- Meet tab helpers, toolbar icon, context menu ------------------------
 
@@ -580,7 +665,7 @@ async function recordFromMenu(tab) {
   if (state.phase === "recording") return;
   try {
     const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id });
-    await beginRecording({ streamId, title: titleFromTab(tab) });
+    await beginRecording({ streamId, title: titleFromTab(tab), tabId: tab.id });
   } catch (e) {
     await setState({ phase: "failed", stage: null, error: String(e?.message || e) });
   }
@@ -605,7 +690,23 @@ async function refreshUpcoming() {
       sb.useSession(session, (s) => store.setSession(s), () => store.getSession());
       const r = await sb.fetchUpcomingMeetings(2); // starts within 2 min or ongoing
       const m = (r && r.meetings && r.meetings[0]) || null;
-      if (m) imminent = { title: m.title || "Meeting", meet_url: m.meet_url || null, start: m.start || null };
+      if (m) {
+        imminent = {
+          title: m.title || "Meeting",
+          meet_url: m.meet_url || null,
+          start: m.start || null,
+          // What the recorder needs to link the meeting to the event's
+          // company and contacts (same shape the panel builds).
+          calendar: {
+            googleEventID: m.google_event_id || null,
+            contactIDs: m.contact_ids || [],
+            companyID: m.company_id || null,
+            companyName: m.company_name || null,
+            companyLogoURL: m.company_logo_url || null,
+            meetURL: m.meet_url || null,
+          },
+        };
+      }
     }
   } catch (e) {
     // Dead session discovered by the SW itself (it can't receive its own
@@ -621,7 +722,11 @@ async function refreshUpcoming() {
     await setState({ imminentCall: imminent });
   }
 }
-chrome.alarms?.onAlarm.addListener((a) => { if (a.name === "wn-upcoming") refreshUpcoming(); });
+chrome.alarms?.onAlarm.addListener((a) => {
+  if (a.name === "wn-upcoming") refreshUpcoming();
+  // Grace period over and the call was not resumed: end the recording.
+  if (a.name === CALL_ENDED_ALARM) stopRecording().catch(() => {});
+});
 
 function boot() {
   loadState().then(() => {

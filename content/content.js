@@ -104,6 +104,11 @@
   function detectInCall() {
     return /^\/[a-z]{3}-[a-z]{4}-[a-z]{3}(\/|$)/.test(location.pathname);
   }
+  // "abc-defg-hij" out of any Meet URL, or null.
+  function meetCode(url) {
+    const m = /meet\.google\.com\/([a-z]{3}-[a-z]{4}-[a-z]{3})(?:[/?#]|$)/i.exec(url || "");
+    return m ? m[1].toLowerCase() : null;
+  }
 
   function mount() {
     if (host) return;
@@ -215,10 +220,14 @@
     if (inCall) {
       // On the call, not yet recording → start it (silent if the tab already
       // carries the activeTab grant) and reveal the panel.
+      // The imminent calendar call, when it IS this call: its title and
+      // calendar context (company, contacts) go with the recording.
+      const here = imm && meetCode(imm.meet_url) && meetCode(imm.meet_url) === meetCode(location.href) ? imm : null;
       const label = document.createElement("span");
-      label.textContent = imm && imm.title ? imm.title : "Winday Meet";
+      label.textContent = here && here.title ? here.title : "Winday Meet";
       const rec = button("Record", "rec", async () => {
-        await send("WN_RECORD_TAB"); // silent path, best-effort — the panel handles any fallback
+        // silent path, best-effort — the panel handles any fallback
+        await send("WN_RECORD_TAB", here ? { title: here.title, calendar: here.calendar || null } : undefined);
         const p = await send("WN_OPEN_PANEL");
         // The docked overlay is ONLY the fallback for browsers whose native
         // side panel doesn't render (Arc). If the native panel opened, it owns
@@ -300,6 +309,42 @@
   function poll() {
     const now = detectInCall();
     if (now !== inCall) { inCall = now; render(); }
+    pollCallLifecycle();
+  }
+
+  // --- Call lifecycle -------------------------------------------------------
+  // Leaving a call keeps the meeting code in the URL: Meet just swaps the
+  // in-call UI for its "You left the meeting" screen. The in-call markers are
+  // the mic/camera toggles (data-is-muted) and the leave button; once they
+  // were seen during a recording and then vanish, the call is over and the
+  // service worker is told so it can end the recording (after a grace
+  // period — a rejoin reports WN_CALL_RESUMED). Gated on the markers having
+  // been seen at all, so a Meet redesign degrades to "no auto-stop", never to
+  // "stops every recording".
+  const LEAVE_RE = /leave call|quitter l.appel|end call|hang up|raccrocher|anruf verlassen|salir de la llamada/i;
+  function detectCallUI() {
+    if (document.querySelector("[data-is-muted]")) return true;
+    for (const b of document.querySelectorAll("button[aria-label], [role=button][aria-label]")) {
+      if (LEAVE_RE.test(b.getAttribute("aria-label") || "")) return true;
+    }
+    return false;
+  }
+  let callUiSeen = false;    // markers observed while the current recording ran
+  let inactivePolls = 0;     // consecutive polls without them (debounce)
+  let endedReported = false;
+  function pollCallLifecycle() {
+    if ((state.phase || "idle") !== "recording") {
+      callUiSeen = false; inactivePolls = 0; endedReported = false;
+      return;
+    }
+    if (inCall && detectCallUI()) {
+      callUiSeen = true;
+      inactivePolls = 0;
+      if (endedReported) { endedReported = false; send("WN_CALL_RESUMED"); }
+      return;
+    }
+    if (!callUiSeen || endedReported) return;
+    if (++inactivePolls >= 2) { endedReported = true; send("WN_CALL_ENDED"); }
   }
 
   // --- Theme --------------------------------------------------------------

@@ -92,10 +92,50 @@ function paintUpcoming() {
   for (const m of upcoming) box.append(upcomingRow(m));
 }
 
+// The Meet call the user is looking at right now (the active tab of this
+// window — in docked mode that is the tab hosting this iframe). A Today row
+// whose Meet link is that call gets a Record button instead of Join, and a
+// plain Start Recording picks up that row's calendar context on its own.
+const MEET_CODE = /meet\.google\.com\/([a-z]{3}-[a-z]{4}-[a-z]{3})(?:[/?#]|$)/i;
+function meetCode(url) {
+  const m = MEET_CODE.exec(url || "");
+  return m ? m[1].toLowerCase() : null;
+}
+let currentCallCode = null;
+async function refreshCurrentCall() {
+  let code = null;
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    code = meetCode(tab && tab.url);
+  } catch (_) { /* no tabs access in this context */ }
+  if (code !== currentCallCode) { currentCallCode = code; paintUpcoming(); }
+}
+chrome.tabs?.onActivated?.addListener(() => { refreshCurrentCall(); });
+chrome.tabs?.onUpdated?.addListener((_id, info) => { if (info.url) refreshCurrentCall(); });
+
+function upcomingForCurrentCall() {
+  if (!currentCallCode) return null;
+  return upcoming.find((m) => meetCode(m.meet_url) === currentCallCode) || null;
+}
+
+/** The recorder's calendar context for a Today row — what links the saved
+ *  meeting to its Google event, company and CRM contacts. */
+function calendarContext(m) {
+  return {
+    googleEventID: m.google_event_id || null,
+    contactIDs: m.contact_ids || [],
+    companyID: m.company_id || null,
+    companyName: m.company_name || null,
+    companyLogoURL: m.company_logo_url || null,
+    meetURL: m.meet_url || null,
+  };
+}
+
 function upcomingRow(m) {
   const row = div("item upcoming");
   const start = new Date(m.start);
   const started = Date.now() >= start.getTime();
+  const onThisCall = !!currentCallCode && meetCode(m.meet_url) === currentCallCode;
 
   const chip = div("up-time" + (started ? " now" : ""));
   chip.textContent = started ? "Now" : start.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -108,7 +148,22 @@ function upcomingRow(m) {
   main.append(title, sub);
 
   const actions = div("item-actions");
-  if (m.meet_url) actions.append(iconBtn("join", "Open the call", () => chrome.tabs.create({ url: m.meet_url })));
+  if (onThisCall) {
+    row.classList.add("here");
+    if (state.phase === "idle") {
+      // You're on this call: record it, with its calendar context attached.
+      const rec = btn("Record", "record-now", () => startRecording({ title: m.title, calendar: calendarContext(m) }));
+      rec.prepend(icon("mic", 15));
+      rec.title = "Record this call";
+      actions.append(rec);
+    } else {
+      const tag = span("tag busy");
+      tag.textContent = state.phase === "recording" ? "Recording" : "Saving…";
+      actions.append(tag);
+    }
+  } else if (m.meet_url) {
+    actions.append(iconBtn("join", "Open the call", () => chrome.tabs.create({ url: m.meet_url })));
+  }
 
   row.append(chip, main, actions);
   return row;
@@ -138,6 +193,7 @@ async function refresh() {
   render();
   syncRemoteMeetings(); // pull durable history (re-renders when it lands)
   syncUpcoming(); // today's calendar calls (paints its own section)
+  refreshCurrentCall(); // which Meet call this panel is looking at
 
   // (Re)opened while a recording runs elsewhere (offscreen / another panel
   // instance): this document wasn't there to accumulate the live finals, so
@@ -258,6 +314,7 @@ function render() {
   else if (liveSession) renderSession();
   else renderList();
   renderBottomBar();
+  paintUpcoming(); // its Record button depends on the phase
 }
 
 // --- Session view (live recording, or a viewed past meeting) --------------
@@ -279,6 +336,13 @@ function renderSession() {
 // on every streaming event, so it skips the rest of the session view.
 function renderTranscript() {
   const recording = state.phase === "recording";
+  // Once the call is saved, its transcript is the meeting's: show the SAVED
+  // one (the batch pass may have re-diarized it) and allow renames.
+  const saved = !recording && state.meetingId ? allMeetings().find((x) => x.id === state.meetingId) : null;
+  if (saved && saved.transcript && saved.transcript.utterances && saved.transcript.utterances.length) {
+    renderBubbles(toBubbles(saved.transcript.utterances), "No transcript.", false, (from, to) => renameParticipant(saved, from, to));
+    return;
+  }
   const bubbles = liveUtterances.slice();
   for (const ch of Object.keys(interim)) {
     const it = interim[ch];
@@ -287,14 +351,69 @@ function renderTranscript() {
   renderBubbles(bubbles, recording ? "Listening… speech appears here as it's spoken." : "No transcript.", recording);
 }
 
+function toBubbles(utts) {
+  return utts.map((u) => ({ channel: u.speaker === "You" ? 0 : 1, speaker: u.speaker, text: u.text }));
+}
+
 function renderViewing(m) {
   $("tab-btn-summary").disabled = false;
   if (!m.summary && activeTab === "summary") activeTab = "transcript";
   setTab(activeTab);
   const utts = (m.transcript && m.transcript.utterances) || [];
-  const bubbles = utts.map((u) => ({ channel: u.speaker === "You" ? 0 : 1, speaker: u.speaker, text: u.text }));
-  renderBubbles(bubbles, "No transcript for this meeting.", false);
+  renderBubbles(toBubbles(utts), "No transcript for this meeting.", false, (from, to) => renameParticipant(m, from, to));
   renderSummaryFor(m);
+}
+
+// --- Participant renaming ----------------------------------------------------
+// Diarization labels the other voices "Participant 1, 2, 3…" — and splits
+// one person into several when it is unsure. The user knows who spoke: a
+// rename applies everywhere the label appears (transcript turns, next-step
+// owners) and is saved with the meeting, on every device.
+const DIARIZED = /^Participant \d+$/i;
+function isDiarized(name) { return DIARIZED.test(String(name || "").trim()); }
+
+function renameParticipant(m, from, to) {
+  const next = String(to || "").trim();
+  if (!m || !from || !next || next === from || next === "You") return;
+  if (m.transcript && Array.isArray(m.transcript.utterances)) {
+    m.transcript = {
+      ...m.transcript,
+      utterances: m.transcript.utterances.map((u) => (u.speaker === from ? { ...u, speaker: next } : u)),
+    };
+  }
+  if (m.summary && Array.isArray(m.summary.next_steps)) {
+    for (const ns of m.summary.next_steps) if (ns && ns.owner === from) ns.owner = next;
+  }
+  // The live view's own copy (the session that just finished).
+  for (const u of liveUtterances) if (u.speaker === from) u.speaker = next;
+  // Persist first: `m` is a merged view, and the repaint reads the cached
+  // entries that persistMeetingEdit brings up to date.
+  persistMeetingEdit(m, { transcript: true, summary: !!m.summary });
+  render();
+}
+
+/** Turns a "Participant N" label into an inline input; Enter renames. */
+function inlineRename(labelEl, from, onRename) {
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = "";
+  input.placeholder = from;
+  let done = false;
+  const finish = (save) => {
+    if (done) return; done = true;
+    const v = input.value.trim();
+    if (save && v && v !== from) onRename(from, v);
+    else input.replaceWith(labelEl);
+  };
+  input.addEventListener("keydown", (e) => {
+    e.stopPropagation();
+    if (e.key === "Enter") finish(true);
+    else if (e.key === "Escape") finish(false);
+  });
+  input.addEventListener("blur", () => finish(true));
+  input.addEventListener("click", (e) => e.stopPropagation());
+  labelEl.replaceWith(input);
+  input.focus();
 }
 
 function setTab(tab) {
@@ -322,7 +441,7 @@ function coalesce(bubbles) {
   return out;
 }
 
-function renderBubbles(bubbles, emptyText, autoscroll) {
+function renderBubbles(bubbles, emptyText, autoscroll, onRename) {
   const box = $("transcript");
   const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 48;
   box.innerHTML = "";
@@ -332,6 +451,12 @@ function renderBubbles(bubbles, emptyText, autoscroll) {
   for (const b of coalesce(bubbles)) {
     const el = div("utt " + (b.channel === 0 ? "you" : "them") + (b.interim ? " interim" : ""));
     const who = div("who"); who.textContent = b.channel === 0 ? "You" : (b.speaker || "Participant");
+    if (onRename && b.channel !== 0 && isDiarized(b.speaker)) {
+      who.classList.add("renamable");
+      who.title = "Rename this participant";
+      who.append(icon("edit", 10));
+      who.addEventListener("click", () => inlineRename(who, b.speaker, onRename));
+    }
     const t = document.createElement("div"); t.textContent = b.text;
     el.append(who, t); box.append(el);
   }
@@ -360,7 +485,12 @@ function renderSummaryFor(m) {
   const summary = m && m.summary;
   if (!summary) { const p = div("summary-pending"); p.append(text("Summary not available.")); box.append(p); return; }
 
-  if (summary.headline) { const h = document.createElement("h2"); h.textContent = summary.headline; box.append(h); }
+  if (summary.headline) {
+    const h = document.createElement("h2");
+    h.textContent = summary.headline;
+    editable(h, m, (v) => { if (v) summary.headline = v; });
+    box.append(h);
+  }
 
   const sep = () => { const hr = document.createElement("div"); hr.className = "sep"; box.append(hr); };
 
@@ -373,11 +503,18 @@ function renderSummaryFor(m) {
     const h = document.createElement("h3"); h.textContent = "Next steps";
     const list = div("todo");
     for (const ns of steps) {
-      const item = document.createElement("label");
-      item.className = "todo-item";
+      // A div, not a <label>: the task text is editable, so a click on it must
+      // not toggle the checkbox — only the box itself does.
+      const item = div("todo-item");
       const cb = document.createElement("input");
       cb.type = "checkbox";
-      cb.addEventListener("change", () => item.classList.toggle("done", cb.checked));
+      cb.checked = ns.done === true; // ticked state is saved with the summary
+      item.classList.toggle("done", cb.checked);
+      cb.addEventListener("change", () => {
+        ns.done = cb.checked;
+        item.classList.toggle("done", cb.checked);
+        persistSummaryEdit(m);
+      });
       const owner = span("owner-pill " + (isUser(ns) ? "user" : "other"));
       owner.textContent = ns.owner || (isUser(ns) ? "You" : "Participant");
       // The pill is editable: the summary sometimes assigns a step to the
@@ -391,6 +528,10 @@ function renderSummaryFor(m) {
         });
       }
       const task = span("todo-task"); task.textContent = ns.task;
+      editable(task, m, (v) => {
+        if (v) ns.task = v;
+        else summary.next_steps = summary.next_steps.filter((x) => x !== ns); // emptied → removed
+      });
       // 4th grid cell — every row needs one (display:contents grid). For the
       // USER'S items it holds the Notion action: add this to-do to the tasks
       // database chosen in Settings (the button shows on row hover).
@@ -417,7 +558,13 @@ function renderSummaryFor(m) {
     const s = document.createElement("section");
     const h = document.createElement("h3"); h.textContent = "Meeting context";
     const ul = document.createElement("ul");
-    for (const c of context) { const li = document.createElement("li"); li.textContent = c; ul.append(li); }
+    // Old summaries keep their bullets in key_points; edits go where they live.
+    const list = summary.context && summary.context.length ? summary.context : summary.key_points;
+    context.forEach((c, i) => {
+      const li = document.createElement("li"); li.textContent = c;
+      editable(li, m, (v) => { if (v) list[i] = v; else list.splice(i, 1); });
+      ul.append(li);
+    });
     s.append(h, ul); box.append(s);
     sep();
   }
@@ -427,8 +574,13 @@ function renderSummaryFor(m) {
   for (const sec of sections) {
     const s = document.createElement("section");
     const h = document.createElement("h3"); h.textContent = sec.title;
+    editable(h, m, (v) => { if (v) sec.title = v; });
     const ul = document.createElement("ul");
-    for (const b of sec.bullets) { const li = document.createElement("li"); li.textContent = b; ul.append(li); }
+    sec.bullets.forEach((b, i) => {
+      const li = document.createElement("li"); li.textContent = b;
+      editable(li, m, (v) => { if (v) sec.bullets[i] = v; else sec.bullets.splice(i, 1); });
+      ul.append(li);
+    });
     s.append(h, ul); box.append(s);
   }
   // Old summaries have no sections — keep their paragraph so nothing is lost.
@@ -436,6 +588,7 @@ function renderSummaryFor(m) {
     const s = document.createElement("section");
     const h = document.createElement("h3"); h.textContent = "Summary";
     const p = document.createElement("p"); p.textContent = summary.summary;
+    editable(p, m, (v) => { if (v) summary.summary = v; });
     s.append(h, p); box.append(s);
   }
 
@@ -498,6 +651,38 @@ function openOwnerMenu(pillEl, m, summary, ns) {
       closeMenu();
       applyOwner(m, ns, label, isUser);
     });
+    if (!isUser && isDiarized(label)) {
+      // "Participant N" is a voice, not a person: rename it here (the whole
+      // transcript follows) and this step goes to the renamed person.
+      const row = div("opt");
+      const pencil = iconBtn("edit", `Rename ${label}`, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const input = document.createElement("input");
+        input.type = "text";
+        input.placeholder = `${label} is…`;
+        let done = false;
+        const finish = (save) => {
+          if (done) return; done = true;
+          const v = input.value.trim();
+          closeMenu();
+          if (save && v) { renameParticipant(m, label, v); applyOwner(m, ns, v, false); }
+        };
+        input.addEventListener("click", (ev) => ev.stopPropagation());
+        input.addEventListener("keydown", (ev) => {
+          ev.stopPropagation();
+          if (ev.key === "Enter") finish(true);
+          else if (ev.key === "Escape") finish(false);
+        });
+        input.addEventListener("blur", () => finish(true));
+        row.replaceChildren(input);
+        input.focus();
+      });
+      pencil.classList.add("rename");
+      row.append(b, pencil);
+      menu.append(row);
+      return;
+    }
     menu.append(b);
   };
   opt(user, true);
@@ -535,17 +720,58 @@ async function applyOwner(m, ns, owner, isUser) {
   await persistSummaryEdit(m);
 }
 
-// Persist an in-place edit of m.summary (reassigned owner, notion_task_url):
-// the local cache when the meeting is in it, the merged remote entry, and the
-// durable Supabase row (metadata.summary) — same pattern as rename, best effort.
-function persistSummaryEdit(m) {
+// --- Editing the notes -------------------------------------------------------
+// The summary is the user's: every line of it can be edited in place. The
+// element commits on blur (Enter commits too, Escape restores), the change
+// lands in the summary object through `apply`, and the meeting is saved —
+// locally and on the server — so it never snaps back to the AI's version.
+function editable(el, m, apply) {
+  if (!m || !m.id) return;
+  el.contentEditable = "plaintext-only";
+  el.spellcheck = false;
+  el.dataset.placeholder = "(empty — removes this line)";
+  let original = el.textContent;
+  el.addEventListener("focus", () => { original = el.textContent; });
+  el.addEventListener("keydown", (e) => {
+    e.stopPropagation();
+    if (e.key === "Enter") { e.preventDefault(); el.blur(); }
+    else if (e.key === "Escape") { el.textContent = original; el.blur(); }
+  });
+  el.addEventListener("blur", () => {
+    const v = el.textContent.replace(/\s+/g, " ").trim();
+    if (v === original.trim()) { el.textContent = original; return; }
+    apply(v);
+    if (!v) render();      // a removed line: repaint the list
+    else el.textContent = v;
+    persistSummaryEdit(m);
+  });
+}
+
+// Persist in-place edits of a meeting's notes — summary (edited text,
+// reassigned owner, ticked step, notion_task_url) and/or transcript (a
+// renamed participant): the local cache when the meeting is in it, the
+// merged remote entry, and the durable Supabase row. Best effort.
+function persistMeetingEdit(m, { summary = true, transcript = false } = {}) {
+  // `m` is the merged view of a row; the cached entries it was built from
+  // (local + remote) get the same fields, so the next repaint agrees.
+  for (const entry of [meetings.find((x) => x.id === m.id), remoteMeetings.find((x) => x.id === m.id)]) {
+    if (!entry) continue;
+    if (summary) entry.summary = m.summary;
+    if (transcript) entry.transcript = m.transcript;
+  }
   if (meetings.some((x) => x.id === m.id)) {
     chrome.runtime.sendMessage({ type: "WN_MEETING_UPSERT", meeting: { ...m } }).catch(() => {});
   }
-  const remote = remoteMeetings.find((x) => x.id === m.id);
-  if (remote) remote.summary = m.summary;
-  return sb.updateMeetingSummary(m.id, m.summary).catch(() => { /* offline / local-only */ });
+  const patch = {};
+  if (summary) patch.summary = m.summary;
+  let text;
+  if (transcript && m.transcript && Array.isArray(m.transcript.utterances)) {
+    patch.transcript = m.transcript;
+    text = m.transcript.utterances.map((u) => `${u.speaker}: ${u.text}`).join("\n");
+  }
+  return sb.updateMeetingContent(m.id, patch, text).catch(() => { /* offline / local-only */ });
 }
+function persistSummaryEdit(m) { return persistMeetingEdit(m, { summary: true }); }
 
 // Send ONE next step to the user's Notion tasks database (Settings → Notion).
 // Success is remembered on the step itself (notion_task_url) so the button
@@ -647,7 +873,14 @@ function renderList() {
 
 function itemRow(m) {
   const row = div("item");
-  const busy = ["transcribing", "summarizing", "exporting"].includes(m.status);
+  // "Processing…" is only real while THIS extension runs the pipeline on it.
+  // A row stuck on a mid-pipeline status with nothing running (the pipeline
+  // died, or another device abandoned it) is unfinished — offer Retry rather
+  // than a badge that never changes.
+  const midway = ["transcribing", "summarizing", "exporting"].includes(m.status);
+  const runningHere = state.phase === "processing" && state.meetingId === m.id;
+  const busy = midway && runningHere;
+  const stuck = midway && !runningHere;
   const local = meetings.some((x) => x.id === m.id); // Retry/Export/Delete act on the local cache
   const viewable = !busy && (m.summary || (m.transcript && m.transcript.utterances && m.transcript.utterances.length));
 
@@ -678,13 +911,17 @@ function itemRow(m) {
     tag = document.createElement("span");
     tag.className = "tag busy";
     tag.textContent = "Processing…";
+  } else if (stuck) {
+    tag = document.createElement("span");
+    tag.className = "tag stuck";
+    tag.textContent = "Unfinished";
   }
 
   const actions = div("item-actions");
   if (!busy) {
     // Retry works on synced meetings too: the server row has the transcript,
     // so a call whose summary failed can be finished from any device.
-    if (m.status === "recorded" || m.status === "failed")
+    if (m.status === "recorded" || m.status === "failed" || stuck)
       actions.append(iconBtn("retry", "Transcribe & summarize", () => chrome.runtime.sendMessage({ type: "WN_RETRY", id: m.id })));
     if (local && m.status === "ready" && !m.notionPageURL)
       actions.append(iconBtn("notion-send", "Send to Notion", () => chrome.runtime.sendMessage({ type: "WN_EXPORT", id: m.id })));
@@ -788,10 +1025,19 @@ const isEmbedded = window.parent !== window;
 let isTabPage = false;
 chrome.tabs.getCurrent().then((t) => { isTabPage = !!t && !isEmbedded; }).catch(() => {});
 
-async function startRecording() {
+async function startRecording(arg) {
+  // Calendar context: explicit from a Today row's Record button, else the
+  // Today call matching the tab we're on (a plain Start Recording still links
+  // the meeting to its event, company and contacts). The bottom-bar button
+  // passes its click event here — that is not a context.
+  let ctx = arg && arg.calendar ? arg : null;
+  if (!ctx) {
+    const u = upcomingForCurrentCall();
+    if (u) ctx = { title: u.title, calendar: calendarContext(u) };
+  }
   // 1) Silent path via the service worker (tabCapture -> offscreen).
   const r = await chrome.runtime
-    .sendMessage({ type: "WN_RECORD_TAB" })
+    .sendMessage({ type: "WN_RECORD_TAB", title: ctx ? ctx.title : undefined, calendar: ctx ? ctx.calendar : undefined })
     .catch((e) => ({ ok: false, error: String(e?.message || e) }));
   if (r?.ok) return;
   if (!r?.needsPickerFallback) {
@@ -834,9 +1080,9 @@ async function startRecording() {
   const micStream = await acquireMic();
   const meeting = {
     id: crypto.randomUUID(),
-    title: r.title || `Meeting ${new Date().toLocaleString()}`,
+    title: (ctx && ctx.title) || r.title || `Meeting ${new Date().toLocaleString()}`,
     startedAt: new Date().toISOString(),
-    calendar: null,
+    calendar: (ctx && ctx.calendar) || null,
   };
   panelRecorder = createRecorder();
   try {
@@ -859,12 +1105,8 @@ async function startRecording() {
   await chrome.runtime
     .sendMessage({ type: "WN_PANEL_REC_STARTED", meeting: { id: meeting.id, title: meeting.title, startedAt: meeting.startedAt } })
     .catch(() => {});
-  // If the user stops the share from the browser bar (or the source ends),
-  // finish the meeting instead of recording silence.
-  const audioTrack = tabStream.getAudioTracks()[0];
-  audioTrack.addEventListener("ended", () => {
-    if (panelRecorder?.isActive()) panelRecorder.stop(false);
-  });
+  // (Stopping the share from the browser bar ends the audio track; the
+  // recorder itself watches for that and finishes the meeting.)
 }
 
 /** getDisplayMedia — scoped to this iframe's top-level tab (the Meet tab)

@@ -88,26 +88,19 @@ Deno.serve(async (req) => {
       end: u.end ?? 0,
     })).filter((u: any) => u.text.trim().length > 0);
 
-    // Echo suppression: when the call plays through speakers, the mic picks the
-    // remote voices back up, so participants' words also appear (garbled) on
-    // the "You" channel. Drop "You" utterances whose words are near-duplicates
-    // (≥70% token overlap) of a time-overlapping participant utterance.
-    const tokens = (s: string) => s.toLowerCase()
-      .normalize("NFD").replace(/[̀-ͯ]/g, "")
-      .replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
-    const participantUtts = mapped.filter((u: any) => u.speaker !== "You");
-    const isEcho = (you: any) => {
-      const yt = tokens(you.text);
-      if (yt.length === 0) return false;
-      for (const p of participantUtts) {
-        if (p.end < you.start - 2 || p.start > you.end + 2) continue;   // ±2s window
-        const pt = new Set(tokens(p.text));
-        const overlap = yt.filter((w: string) => pt.has(w)).length / yt.length;
-        if (overlap >= 0.7) return true;
-      }
-      return false;
-    };
-    const utterances = mapped.filter((u: any) => u.speaker !== "You" || !isEcho(u));
+    // Echo suppression (only meaningful when we have a "You" channel): when the
+    // call plays through speakers, the mic picks the remote voices back up, so
+    // participants' words also appear (garbled) on the "You" channel. Drop "You"
+    // utterances whose words are near-duplicates (≥70% token overlap) of a
+    // time-overlapping participant utterance. Mirrors the Deepgram function.
+    //
+    // Tokenised ONCE per utterance and compared only inside a sliding ±2s
+    // window over the time-sorted participant turns: the naive pairwise
+    // version re-tokenised every participant turn for every "You" turn, and a
+    // one-hour call (~1,500 turns each side) blew the edge runtime's CPU
+    // budget — the transcript was written, then the function was killed
+    // before it could answer (HTTP 546).
+    const utterances = suppressEcho(mapped);
 
     // An empty transcription means the audio itself is silent/broken (e.g. the
     // recording died mid-meeting). Surface that as a hard failure instead of
@@ -145,5 +138,44 @@ Deno.serve(async (req) => {
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status, headers: { ...cors, "Content-Type": "application/json" },
+  });
+}
+
+/// Token set of an utterance: lower-case, accents stripped, punctuation out.
+function tokenSet(s: string): Set<string> {
+  return new Set(
+    s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean),
+  );
+}
+
+/// Drops "You" turns that echo a time-overlapping participant turn (≥70% of
+/// the "You" tokens present in it). Linear in practice: one tokenisation per
+/// turn, and only turns within ±2s are compared.
+function suppressEcho(utts: Array<{ speaker: string; text: string; start: number; end: number }>) {
+  const WINDOW = 2;
+  const parts = utts.filter((u) => u.speaker !== "You")
+    .map((u) => ({ start: u.start, end: u.end, toks: tokenSet(u.text) }));
+  // Sorted by start; a pointer skips participant turns that ended too early
+  // for ANY later "You" turn (utts are start-sorted, so this only advances).
+  let from = 0;
+  return utts.filter((u) => {
+    if (u.speaker !== "You") return true;
+    const yt = [...tokenSet(u.text)];
+    if (yt.length === 0) return true;
+    while (from < parts.length && parts[from].end < u.start - WINDOW) {
+      // Participant turns are start-sorted, not end-sorted: only skip while
+      // the run of early-ending turns is contiguous from the front.
+      from++;
+    }
+    for (let i = from; i < parts.length; i++) {
+      const p = parts[i];
+      if (p.start > u.end + WINDOW) break;
+      if (p.end < u.start - WINDOW) continue;
+      let hits = 0;
+      for (const w of yt) if (p.toks.has(w)) hits++;
+      if (hits / yt.length >= 0.7) return false;
+    }
+    return true;
   });
 }

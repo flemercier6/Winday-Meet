@@ -97,10 +97,33 @@ Works in **Chrome**, **Dia** and **Arc**. The panel has two display modes
      starts, hosted inside the panel iframe.
    - **Right‑click the call page → “Winday Meet — Enregistrer ce call”** —
      fully silent (the menu click itself authorizes the capture, no dialog).
+   - **Record on a Today row** — the panel lists today's calendar calls; the
+     row for the call you are on shows a **Record** button. Recording from it
+     (or a plain *Start Recording* while on that call) attaches the event's
+     company and contacts to the meeting.
 4. The elapsed time stays visible in the panel and the pill; stop from either.
+   The recording also **stops by itself** when the call is over: the call's
+   tab is closed or navigates away, or you leave the call (Meet's "You left"
+   screen) — after a 30‑second grace period, in case you rejoin.
 5. When you stop, the extension uploads, transcribes, summarizes and (if
    enabled) exports to Notion. Progress and the result stay visible in the
    panel, and the meeting appears in the Winday CRM.
+6. The notes are yours: every line of the summary can be edited in place
+   (headline, next steps, context, sections), the next‑step checkboxes stay
+   ticked, and a diarized **Participant N** can be renamed (from the
+   transcript label or the owner menu) — the whole transcript and the next
+   steps follow. Everything is saved with the meeting, on every device.
+
+### Which company was that call with?
+
+`enrich-meeting` links each meeting to a CRM company, most reliable signal
+first: the company already matched from the calendar event; a participant's
+e‑mail domain (`alex@modjo.ai` → Modjo); a participant who is a CRM contact
+(their company); the call's title (a company name or domain label); and
+finally a contact named in the title when the CRM knows exactly one person by
+that first name (`Frédéric / Matthieu` → Matthieu Bagur → Mooncard). The
+result lands in `metadata.calendar.company_*` (where the CRM reads it) with
+`metadata.company_source` saying which rule fired.
 
 ### Importing a transcript you already have
 

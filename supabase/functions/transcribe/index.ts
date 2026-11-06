@@ -11,8 +11,15 @@
 // human-readable TEXT columns; the structured payload (utterances, language, …)
 // is kept in the `metadata` jsonb column so nothing is lost.
 //
+// Long calls recorded by the Chrome extension may be a chain of segments
+// (metadata.audio_segments, see segments.ts): each one is sent to Deepgram,
+// its timestamps shifted by the segment's offset, and the results merged. A
+// meeting without the list (macOS recordings, older calls) is one segment at
+// `audio_path` — unchanged behaviour.
+//
 // The Deepgram API key lives ONLY here, as the `DEEPGRAM_API_KEY` secret.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { audioSegments, mergeSegmentUtterances } from "./segments.ts";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -48,11 +55,8 @@ Deno.serve(async (req) => {
     const { data: meeting, error: mErr } = await admin
       .from("meetings").select("*").eq("id", meeting_id).eq("user_id", user.id).single();
     if (mErr || !meeting) return json({ error: "Meeting not found" }, 404);
-    if (!meeting.audio_path) return json({ error: "Meeting has no audio_path" }, 400);
-
-    const { data: signed, error: sErr } = await admin.storage
-      .from("recordings").createSignedUrl(meeting.audio_path, 600);
-    if (sErr || !signed) return json({ error: "Could not sign audio URL" }, 500);
+    const segments = audioSegments(meeting);
+    if (segments.length === 0) return json({ error: "Meeting has no audio_path" }, 400);
 
     const dgUrl = new URL("https://api.deepgram.com/v1/listen");
     const dgParams: Record<string, string> = {
@@ -68,19 +72,35 @@ Deno.serve(async (req) => {
     else dgParams.detect_language = "true";    // auto-detect any language
     for (const [k, v] of Object.entries(dgParams)) dgUrl.searchParams.set(k, v);
 
-    const dgResp = await fetch(dgUrl, {
-      method: "POST",
-      headers: { Authorization: `Token ${DEEPGRAM_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ url: signed.signedUrl }),
-    });
-    if (!dgResp.ok) return json({ error: `Deepgram ${dgResp.status}: ${await dgResp.text()}` }, 502);
-
-    const dg = await dgResp.json();
+    // One Deepgram request per segment, in parallel.
+    const results = await Promise.all(segments.map(async (seg, index) => {
+      try {
+        const { data: signed, error: sErr } = await admin.storage
+          .from("recordings").createSignedUrl(seg.path, 3600);
+        if (sErr || !signed) throw new Error(`Could not sign audio URL (${seg.path})`);
+        const dgResp = await fetch(dgUrl, {
+          method: "POST",
+          headers: { Authorization: `Token ${DEEPGRAM_API_KEY}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ url: signed.signedUrl }),
+        });
+        if (!dgResp.ok) throw new Error(`Deepgram ${dgResp.status}: ${await dgResp.text()}`);
+        return { index, offset: seg.offset, dg: await dgResp.json(), error: null as string | null };
+      } catch (e) {
+        return { index, offset: seg.offset, dg: null as any, error: String((e as Error)?.message ?? e) };
+      }
+    }));
+    const done = results.filter((r) => r.dg);
+    if (done.length === 0) return json({ error: results[0]?.error ?? "Deepgram failed." }, 502);
+    const gaps = results.filter((r) => !r.dg).map((r) => ({ index: r.index, offset: r.offset, error: r.error }));
+    if (gaps.length) console.log(`[transcribe] ${meeting_id}: ${gaps.length}/${results.length} segment(s) skipped`, gaps);
+    const dg = done[0].dg;
 
     // Build labelled utterances. Channel 0 = you, channel 1 = the meeting
     // (diarized into Participant 1, 2, …).
-    const raw = (dg?.results?.utterances ?? []).slice().sort(
-      (a: any, b: any) => (a.start ?? 0) - (b.start ?? 0));
+    const raw = mergeSegmentUtterances(done.map((r) => ({
+      offset: r.offset,
+      utterances: (r.dg?.results?.utterances ?? []) as any[],
+    })));
     const mapped = raw.map((u: any) => ({
       speaker: (u.channel ?? 0) === 0 ? "You" : `Participant ${(u.speaker ?? 0) + 1}`,
       text: u.transcript ?? "",
@@ -120,7 +140,12 @@ Deno.serve(async (req) => {
     // Human-readable transcript for the CRM's TEXT column.
     const labelled = utterances.map((u: any) => `${u.speaker}: ${u.text}`).join("\n");
 
-    const metadata = { ...(meeting.metadata ?? {}), transcript, language };
+    const metadata = {
+      ...(meeting.metadata ?? {}),
+      transcript,
+      language,
+      transcription_gaps: gaps.length ? gaps : undefined,
+    };
 
     await admin.from("meetings").update({
       transcript: labelled,

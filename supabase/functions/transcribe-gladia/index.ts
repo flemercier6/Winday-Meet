@@ -13,8 +13,17 @@
 // Language: `language` pins one; "multi"/unset lets Gladia auto-detect with
 // code-switching enabled (the language can change mid-call).
 //
+// Long calls: the audio may be a chain of segments (metadata.audio_segments,
+// see segments.ts). Each segment is its own Gladia job — launched together,
+// polled together — and the timestamps are shifted by the segment's offset
+// before the merge. Gladia caps one file at 135 min; Storage caps one upload;
+// segments keep every call under both, however long it runs. A segment that
+// fails is skipped (and listed in metadata.transcription_gaps) as long as
+// another one produced speech: half the notes beat none.
+//
 // The Gladia API key lives ONLY here, as the `GLADIA_API_KEY` secret.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { audioSegments, mergeSegmentUtterances } from "./segments.ts";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -53,52 +62,64 @@ Deno.serve(async (req) => {
     const { data: meeting, error: mErr } = await admin
       .from("meetings").select("*").eq("id", meeting_id).eq("user_id", user.id).single();
     if (mErr || !meeting) return json({ error: "Meeting not found" }, 404);
-    if (!meeting.audio_path) return json({ error: "Meeting has no audio_path" }, 400);
+    const segments = audioSegments(meeting);
+    if (segments.length === 0) return json({ error: "Meeting has no audio_path" }, 400);
 
-    const { data: signed, error: sErr } = await admin.storage
-      .from("recordings").createSignedUrl(meeting.audio_path, 600);
-    if (sErr || !signed) return json({ error: "Could not sign audio URL" }, 500);
-
-    // Kick off the async transcription.
-    const initResp = await fetch(GLADIA_BASE, {
-      method: "POST",
-      headers: { "x-gladia-key": GLADIA_API_KEY, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        audio_url: signed.signedUrl,
-        diarization: true,
-        language_config: {
-          languages: lang ? [lang] : [],   // [] = auto-detect any language
-          code_switching: !lang,           // allow mid-call language changes when auto
-        },
-      }),
-    });
-    if (!initResp.ok) return json({ error: `Gladia init ${initResp.status}: ${await initResp.text()}` }, 502);
-    const init = await initResp.json();
-    const resultUrl = init?.result_url || (init?.id ? `${GLADIA_BASE}/${init.id}` : null);
-    if (!resultUrl) return json({ error: "Gladia init returned no result URL." }, 502);
-
-    // Poll until done.
-    const deadline = Date.now() + POLL_DEADLINE_MS;
-    let result: any = null;
-    while (Date.now() < deadline) {
-      const pollResp = await fetch(resultUrl, { headers: { "x-gladia-key": GLADIA_API_KEY } });
-      if (!pollResp.ok) return json({ error: `Gladia poll ${pollResp.status}: ${await pollResp.text()}` }, 502);
-      const body = await pollResp.json();
-      if (body?.status === "done") { result = body; break; }
-      if (body?.status === "error") {
-        return json({ error: `Gladia transcription failed: ${body?.error_code ?? "unknown error"}` }, 502);
+    // One Gladia job per segment, all in flight at once.
+    const jobs = await Promise.all(segments.map(async (seg, index) => {
+      try {
+        const { data: signed, error: sErr } = await admin.storage
+          .from("recordings").createSignedUrl(seg.path, 3600);
+        if (sErr || !signed) throw new Error(`Could not sign audio URL (${seg.path})`);
+        const resultUrl = await gladiaInit(signed.signedUrl, lang);
+        return { index, offset: seg.offset, resultUrl, result: null as any, error: null as string | null };
+      } catch (e) {
+        return { index, offset: seg.offset, resultUrl: null, result: null as any, error: String((e as Error)?.message ?? e) };
       }
-      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-    }
-    if (!result) return json({ error: "Gladia transcription timed out — try again for long recordings." }, 504);
+    }));
 
-    const transcription = result?.result?.transcription ?? {};
-    const raw = (transcription.utterances ?? []).slice().sort(
-      (a: any, b: any) => (a.start ?? 0) - (b.start ?? 0));
+    // Poll every pending job until all are done (or failed), or the deadline.
+    const deadline = Date.now() + POLL_DEADLINE_MS;
+    while (Date.now() < deadline && jobs.some((j) => j.resultUrl && !j.result && !j.error)) {
+      await Promise.all(jobs.filter((j) => j.resultUrl && !j.result && !j.error).map(async (j) => {
+        try {
+          const pollResp = await fetch(j.resultUrl!, { headers: { "x-gladia-key": GLADIA_API_KEY } });
+          if (!pollResp.ok) { j.error = `Gladia poll ${pollResp.status}: ${await pollResp.text()}`; return; }
+          const body = await pollResp.json();
+          if (body?.status === "done") j.result = body;
+          else if (body?.status === "error") j.error = `Gladia transcription failed: ${body?.error_code ?? "unknown error"}`;
+        } catch (e) {
+          j.error = `Gladia poll error: ${String(e)}`;
+        }
+      }));
+      if (jobs.some((j) => j.resultUrl && !j.result && !j.error)) {
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+      }
+    }
+    for (const j of jobs) {
+      if (!j.result && !j.error) j.error = "Gladia transcription timed out — try again for long recordings.";
+    }
+    const done = jobs.filter((j) => j.result);
+    if (done.length === 0) {
+      const first = jobs[0]?.error ?? "Gladia transcription failed.";
+      const status = /timed out/.test(first) ? 504 : 502;
+      return json({ error: first }, status);
+    }
+    const gaps = jobs.filter((j) => !j.result).map((j) => ({ index: j.index, offset: j.offset, error: j.error }));
+    if (gaps.length) console.log(`[transcribe-gladia] ${meeting_id}: ${gaps.length}/${jobs.length} segment(s) skipped`, gaps);
+
+    const transcriptions = done.map((j) => j.result?.result?.transcription ?? {});
+    const raw = mergeSegmentUtterances(done.map((j, i) => ({
+      offset: j.offset,
+      utterances: (transcriptions[i].utterances ?? []) as any[],
+    })));
 
     // Speaker labels. Preferred: channel 0 = "You", channel 1 = the meeting,
     // whose speakers (diarization) become Participant 1, 2, … in order of first
     // appearance. Fallback (channels not preserved): diarization-only labels.
+    // Across segments a diarization index is taken to be the same person —
+    // exact for the usual 1:1 call (one remote voice); with several remote
+    // speakers, labels after a segment boundary may swap.
     const hasChannels = raw.some((u: any) => (u.channel ?? 0) > 0);
     const partIndex = new Map<string, number>();
     const participantLabel = (key: string) => {
@@ -141,7 +162,7 @@ Deno.serve(async (req) => {
     }
 
     const fullText = utterances.map((u: any) => u.text).join(" ");
-    const language = (transcription.languages ?? [])[0] ?? lang ?? null;
+    const language = (transcriptions[0]?.languages ?? [])[0] ?? lang ?? null;
 
     // Structured payload the app + CRM UI consume.
     const transcript = { fullText, utterances, language };
@@ -153,6 +174,8 @@ Deno.serve(async (req) => {
       transcript,
       language,
       transcription_provider: "gladia",   // A/B marker: which engine made this transcript
+      // Segments that could not be transcribed (absent when every one was).
+      transcription_gaps: gaps.length ? gaps : undefined,
     };
 
     await admin.from("meetings").update({
@@ -167,6 +190,36 @@ Deno.serve(async (req) => {
     return json({ error: String(e) }, 500);
   }
 });
+
+/** Starts one async Gladia job; returns its result URL. Retries briefly on
+ *  429/503 — several segments start at once and may hit a concurrency cap. */
+async function gladiaInit(audioUrl: string, lang: string | null): Promise<string> {
+  let lastErr = "";
+  for (let attempt = 0; attempt < 4; attempt++) {
+    if (attempt) await new Promise((r) => setTimeout(r, 2000 * attempt));
+    const initResp = await fetch(GLADIA_BASE, {
+      method: "POST",
+      headers: { "x-gladia-key": GLADIA_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        audio_url: audioUrl,
+        diarization: true,
+        language_config: {
+          languages: lang ? [lang] : [],   // [] = auto-detect any language
+          code_switching: !lang,           // allow mid-call language changes when auto
+        },
+      }),
+    });
+    if (initResp.ok) {
+      const init = await initResp.json();
+      const resultUrl = init?.result_url || (init?.id ? `${GLADIA_BASE}/${init.id}` : null);
+      if (!resultUrl) throw new Error("Gladia init returned no result URL.");
+      return resultUrl;
+    }
+    lastErr = `Gladia init ${initResp.status}: ${await initResp.text()}`;
+    if (initResp.status !== 429 && initResp.status !== 503) break;
+  }
+  throw new Error(lastErr);
+}
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {

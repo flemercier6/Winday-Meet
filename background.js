@@ -13,6 +13,7 @@
 import * as store from "./lib/store.js";
 import * as sb from "./lib/supabase.js";
 import { STAGE_LABELS } from "./lib/pipeline.js";
+import * as unsent from "./lib/unsent.js";
 
 const OFFSCREEN_PATH = "offscreen.html";
 // The Winday CRM web app (same Supabase project as the extension) — used for
@@ -390,6 +391,7 @@ async function handle(msg, sender) {
 
     case "WN_DISCARD":
       await store.removeMeeting(msg.id);
+      await unsent.dropAudio(msg.id); // a deleted meeting's kept audio goes too
       broadcast();
       return { ok: true };
 
@@ -450,6 +452,7 @@ function mergeForRetry(local, remote) {
   return {
     ...local,
     audioPath: local.audioPath || remote.audioPath || null,
+    audioSegments: local.audioSegments || remote.audioSegments || null,
     transcript: hasUtts(local.transcript) ? local.transcript
       : hasUtts(remote.transcript) ? remote.transcript : (local.transcript || null),
     summary: local.summary || remote.summary || null,

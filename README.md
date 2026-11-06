@@ -36,11 +36,19 @@ one shows up in the same place.
    (`chrome.tabCapture`, i.e. the remote participants) and your **microphone**
    (`getUserMedia`), and mixes them with the Web Audio API into a single
    **stereo** stream: **left = you**, **right = the meeting**. It records that to
-   `webm/opus` with `MediaRecorder` at **48 kbps** — plenty for speech, and it
-   keeps a multi‑hour call well under the Storage upload limit.
+   `webm/opus` with `MediaRecorder` at **48 kbps** — plenty for speech.
+   **Long calls are recorded as a chain of standalone files** ("segments"): a
+   fresh recorder takes over every **60 min**, or as soon as a file reaches
+   **40 MB** (the browser does not always honour the bitrate). Every upload
+   stays under Storage's 50 MB limit and every file under Gladia's 135‑min cap,
+   however long the call; a call under an hour is still exactly one file.
 2. **Upload** — the recording is uploaded to the private Supabase `recordings`
-   bucket and a `meetings` row is created (Row‑Level Security: you only ever see
-   your own). When the upload fails (over the project's Storage upload limit, or
+   bucket (`<uid>/<id>.webm`, then `<id>.s1.webm`, `<id>.s2.webm`… for the
+   following segments, listed with their start offset in
+   `metadata.audio_segments`) and a `meetings` row is created (Row‑Level
+   Security: you only ever see your own). If the pipeline fails before the
+   audio is up, the audio is **kept in IndexedDB** (`wn-unsent`, newest 3) and
+   **Retry** uploads it — no more "record again". When the upload fails (over the project's Storage upload limit, or
    a network drop) and a live transcript exists, the meeting is still saved,
    summarized and exported — only the playable audio is lost, and the reason is
    kept in `metadata.audio_upload_error`.
@@ -48,7 +56,8 @@ one shows up in the same place.
    Functions by meeting id. Transcription goes to the engine chosen in
    Settings: **Gladia** (`transcribe-gladia` — async pre‑recorded API with
    diarization + auto language detection; the saved transcript is always this
-   batch pass, the live captions are display‑only) or **Deepgram**
+   batch pass, the live captions are display‑only; each segment is its own
+   Gladia job, run in parallel and merged on the call's timeline) or **Deepgram**
    (`transcribe` / `transcribe-stream`, multichannel — the same functions the
    macOS app uses). Either way **channel 0 = "You"**, **channel 1 = the
    others**. Gemini and Notion run next, all **using secrets stored
@@ -200,7 +209,13 @@ are untouched, so the macOS app keeps working unchanged):
   init + poll), diarization + auto language detection with code‑switching.
 - `transcribe-stream-gladia` — live relay (Gladia v2 live), deployed with
   `verify_jwt=false` like `transcribe-stream` (the user JWT is validated inside
-  the function — browsers can't set headers on a WebSocket).
+  the function — browsers can't set headers on a WebSocket). Gladia live only
+  accepts 8/16 kHz since Nov 2026, so the relay down‑samples the extension's
+  48 kHz PCM to 16 kHz (`resample.ts`) — no extension update needed for that.
+
+`transcribe-gladia` and `transcribe` both read `metadata.audio_segments` (see
+their `segments.ts` — keep the two copies identical); a meeting without it is
+one file at `audio_path`, exactly as before.
 
 ## Project layout
 

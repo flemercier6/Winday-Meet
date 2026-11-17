@@ -253,7 +253,7 @@ button:disabled { opacity: 0.5; cursor: default; }
    A GRID with a max-content pill column keeps every task text aligned at the
    same x even though pills have different natural widths. */
 .summary .todo {
-  display: grid; grid-template-columns: auto max-content 1fr auto;
+  display: grid; grid-template-columns: auto max-content 1fr auto auto;
   column-gap: 8px; row-gap: 7px; align-items: start; width: 100%;
 }
 .summary .todo-item { display: contents; }
@@ -331,6 +331,52 @@ button:disabled { opacity: 0.5; cursor: default; }
 .summary .todo-item:hover .todo-notion > button.added { opacity: 1; }
 .summary .todo-notion .spinner { width: 12px; height: 12px; }
 
+/* "Add as a task in Winday Data" — the last column of a next step: Winday's
+   mark, right-aligned, shown on hover (and kept once the step was sent, ticked,
+   so a glance says which already went). */
+.summary .todo-send { position: relative; justify-self: end; align-self: start; }
+.summary .send-task {
+  position: relative; display: inline-flex; align-items: center; justify-content: center;
+  width: 24px; height: 22px; margin-top: -2px; padding: 0;
+  border: 1px solid var(--border-default); border-radius: var(--radius-sm);
+  background: var(--bg-surface); color: var(--text-secondary);
+  opacity: 0; transition: opacity .12s ease, background .12s ease, color .12s ease;
+}
+.summary .todo-item:hover .send-task,
+.summary .send-task:focus-visible,
+.summary .send-task.open,
+.summary .send-task.sent { opacity: 1; }
+.summary .send-task:hover, .summary .send-task.open { background: var(--bg-surface-hover); color: var(--text-primary); }
+.summary .send-task.sent { color: var(--text-brand); border-color: var(--border-subtle); }
+.summary .send-task .send-tick {
+  position: absolute; right: -4px; bottom: -4px; display: inline-flex;
+  border-radius: var(--radius-full); background: var(--bg-surface); color: var(--success, var(--text-brand));
+}
+
+/* Its menu: the workspaces to send the step to. */
+.summary .task-menu { top: calc(100% + 4px); right: 0; width: 232px; cursor: default; }
+.summary .task-menu * { cursor: default; }
+.summary .task-menu button { cursor: pointer; }
+.summary .task-menu-head {
+  padding: 6px 10px 4px; font-size: 11px; line-height: 16px; font-weight: 600;
+  color: var(--text-secondary); letter-spacing: 0.01em;
+}
+.summary .task-menu-body { display: flex; flex-direction: column; gap: 2px; }
+.summary .task-menu-list { display: flex; flex-direction: column; gap: 1px; max-height: 220px; overflow-y: auto; }
+.summary .task-menu-note, .summary .task-menu-error, .summary .task-menu-done {
+  padding: 6px 10px; font-size: 12px; line-height: 16px; color: var(--text-secondary);
+}
+.summary .task-menu-error { color: var(--danger); }
+.summary .task-menu-done { color: var(--text-primary); }
+.summary .task-menu button.primary-action {
+  margin: 4px 6px 6px; width: auto; text-align: center; font-weight: 500;
+  background: var(--bg-inverse); color: var(--text-inverse);
+}
+.summary .task-menu button.primary-action:hover { background: var(--bg-inverse-hover); }
+.summary .task-menu button:disabled { opacity: .55; cursor: default; }
+.summary .task-menu-foot { border-top: 1px solid var(--border-subtle); margin-top: 2px; padding-top: 2px; }
+.summary .task-menu button.foot-action { font-size: 12px; color: var(--text-muted); }
+
 .summary .links { display: flex; gap: 8px; flex-wrap: wrap; }
 .summary-pending { margin: auto; display: flex; flex-direction: column; align-items: center; gap: 10px; color: var(--text-secondary); font-size: 13px; }
 
@@ -351,6 +397,27 @@ a.linkbtn:hover, button.linkbtn:hover { background: var(--bg-surface-hover); }
   padding: 13px 16px; font-size: 15px; border-radius: var(--radius-md); flex: none;
 }
 .bottombar .start:hover { background: var(--bg-inverse-hover); }
+/* Two ways to start: the Meet call (primary), or a meeting in the room. */
+.bottombar .start-row { display: flex; gap: 8px; }
+.bottombar .start-row .start { flex: 1; width: auto; }
+.bottombar .start.in-person {
+  flex: none; padding: 13px 14px; font-size: 14px;
+  background: var(--bg-surface); color: var(--text-primary);
+  border: 1px solid var(--border-default);
+}
+.bottombar .start.in-person:hover { background: var(--bg-surface-hover); }
+
+/* In person: a line above the transcript, and the "That's me" claim. */
+.transcript-note {
+  align-self: stretch; font-size: 12px; line-height: 16px; color: var(--text-secondary);
+  background: var(--bg-inset); border-radius: var(--radius-sm); padding: 7px 10px;
+}
+.rename-wrap { display: inline-flex; align-items: center; gap: 6px; }
+.rename-wrap button.claim-voice {
+  flex: none; font-size: 11px; line-height: 16px; font-weight: 600; padding: 2px 8px;
+  border-radius: var(--radius-full); background: var(--info-subtle); color: var(--info-on-subtle);
+}
+.rename-wrap button.claim-voice:hover { filter: brightness(0.96); }
 .rec-controls { display: flex; align-items: center; gap: 10px; }
 .rec-controls .stop-btn { flex: none; display: inline-flex; align-items: center; gap: 6px; background: var(--danger); color: #fff; border-radius: var(--radius-md); padding: 11px 16px; }
 .rec-controls .stop-btn:hover { background: #9d4636; }

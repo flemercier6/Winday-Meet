@@ -14,6 +14,7 @@ import * as store from "./lib/store.js";
 import * as sb from "./lib/supabase.js";
 import { STAGE_LABELS } from "./lib/pipeline.js";
 import * as unsent from "./lib/unsent.js";
+import * as windayData from "./lib/winday-data.js";
 
 const OFFSCREEN_PATH = "offscreen.html";
 // The Winday CRM web app (same Supabase project as the extension) — used for
@@ -33,6 +34,7 @@ let state = {
   error: null,
   recorderHost: null, // "offscreen" | "panel" while recording
   recordingTabId: null, // the Meet tab being captured, while recording
+  mode: null, // "call" | "in_person" — what is being recorded
   imminentCall: null, // {title, meet_url, start} from the calendar, for the pill
   panelOpen: false, // a NATIVE side panel is open somewhere (pill hides itself)
 };
@@ -224,6 +226,50 @@ async function handle(msg, sender) {
       return { ok: true };
     }
 
+    // --- Winday Data: a call's next steps → the user's Tasks list ---
+    // The OAuth link lives here (chrome.identity is a service-worker API);
+    // the panel asks for the workspaces and sends each step it is told to.
+    case "WN_DATA_CONNECT": {
+      try {
+        await windayData.connect();
+        return { ok: true, ...(await windayWorkspaces()) };
+      } catch (e) {
+        return dataError(e);
+      }
+    }
+
+    case "WN_DATA_WORKSPACES": {
+      try {
+        if (!(await windayData.isConnected())) return { ok: false, code: "not_connected" };
+        return { ok: true, ...(await windayWorkspaces()) };
+      } catch (e) {
+        return dataError(e);
+      }
+    }
+
+    case "WN_DATA_CREATE_TASK": {
+      try {
+        const res = await windayData.createTask({
+          workspace_id: msg.workspaceId,
+          title: msg.title,
+          description: msg.description || null,
+        });
+        const sent = await store.markTaskSent(msg.key, {
+          workspaceId: res.workspace?.id || msg.workspaceId,
+          workspaceName: res.workspace?.name || msg.workspaceName || null,
+          taskId: res.task?.id || null,
+        });
+        await store.setLastTaskWorkspace(msg.workspaceId);
+        return { ok: true, sent };
+      } catch (e) {
+        return dataError(e);
+      }
+    }
+
+    case "WN_DATA_DISCONNECT":
+      await windayData.disconnect();
+      return { ok: true };
+
     // Latest persisted session, for contexts without chrome.storage (offscreen).
     case "WN_GET_SESSION":
       return { ok: true, session: await store.getSession() };
@@ -242,6 +288,17 @@ async function handle(msg, sender) {
         return { ok: false, needsPickerFallback: true, title: msg.title || titleFromTab(tab), tabId: tab.id };
       }
     }
+
+    // An in-person meeting: no call tab to capture, only the microphone. It
+    // records in the offscreen document like the silent path, from any tab
+    // (or none), and no Meet tab closing or call ending can stop it.
+    case "WN_RECORD_IN_PERSON":
+      return beginRecording({
+        inPerson: true,
+        title: msg.title,
+        calendar: msg.calendar,
+        tabId: null,
+      });
 
     // The NATIVE side panel refuses to host a fallback recording (the capture
     // dies with the panel document): dock the panel iframe in the call's tab,
@@ -462,17 +519,20 @@ function mergeForRetry(local, remote) {
   };
 }
 
-/** Starts an offscreen (silent-path) recording from a tabCapture stream id. */
-async function beginRecording({ streamId, title, calendar, tabId }) {
+/** Starts an offscreen recording: a call from a tabCapture stream id (the
+ *  silent path), or an in-person meeting from the microphone alone. */
+async function beginRecording({ streamId, inPerson, title, calendar, tabId }) {
   if (state.phase === "recording") return { ok: false, error: "Already recording." };
   const session = await store.getSession();
   if (!session) return { ok: false, error: "Sign in first." };
   const settings = await store.getSettings();
   const meeting = {
     id: crypto.randomUUID(),
+    // "Meeting …" is replaced by the summary's headline once it is written.
     title: title || `Meeting ${new Date().toLocaleString()}`,
     startedAt: new Date().toISOString(),
     calendar: calendar || null,
+    mode: inPerson ? "in_person" : "call",
   };
   clearCallEndedTimer(); // a leftover grace timer must not end THIS recording
   await ensureOffscreen();
@@ -486,8 +546,9 @@ async function beginRecording({ streamId, title, calendar, tabId }) {
     error: null,
     recorderHost: "offscreen",
     recordingTabId: tabId ?? null,
+    mode: meeting.mode,
   });
-  await sendToOffscreen({ type: "START", streamId, meeting, session, settings });
+  await sendToOffscreen({ type: "START", streamId, inPerson: !!inPerson, meeting, session, settings });
   return { ok: true, meetingId: meeting.id };
 }
 
@@ -747,3 +808,21 @@ function boot() {
 chrome.runtime.onInstalled.addListener(boot);
 chrome.runtime.onStartup.addListener(boot);
 boot();
+
+// --- Winday Data helpers ----------------------------------------------------
+
+/** The workspaces a step can go to, the one used last first. */
+async function windayWorkspaces() {
+  const [res, last] = await Promise.all([windayData.listWorkspaces(), store.getLastTaskWorkspace()]);
+  const workspaces = (res.workspaces || []).slice().sort((a, b) => (b.id === last) - (a.id === last));
+  return { tasksEnabled: res.tasks_enabled === true, workspaces, lastWorkspaceId: last };
+}
+
+/** A Winday Data failure, as the panel shows it: its code, and a sentence. */
+function dataError(e) {
+  return {
+    ok: false,
+    code: e?.code || "error",
+    error: String(e?.message || e || "Winday Data could not be reached."),
+  };
+}

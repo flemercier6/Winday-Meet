@@ -13,6 +13,11 @@ export const CONFIG = {
   supabaseURL: "https://gagfovgnuttmngnhqzwd.supabase.co",
   supabaseAnonKey: "sb_publishable_pkIHh7RHiAubkwA-De9RMg_g74nhbN_",
 
+  // Winday Data — a SEPARATE app with its own accounts (not this Supabase
+  // project). The panel sends a call's next steps to the user's Tasks list
+  // there, through an OAuth connection limited to Tasks (lib/winday-data.js).
+  windayDataURL: "https://data.winday.app",
+
   // Non-secret model defaults (overridable in Options).
   // Transcription engine: "gladia" (test) or "deepgram". Both live server-side
   // as separate Edge Functions, so switching is instant and reversible.

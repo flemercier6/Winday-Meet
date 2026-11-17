@@ -17,6 +17,11 @@
 // meeting without the list (macOS recordings, older calls) is one segment at
 // `audio_path` — unchanged behaviour.
 //
+// In-person meetings (`recording_mode: "in_person"`, in the request or the
+// row's metadata): ONE room microphone, mono. No multichannel — every voice is
+// diarized into Participant 1..N, numbered by first appearance, and there is
+// no "You" channel to suppress echoes from. Calls are unchanged.
+//
 // The Deepgram API key lives ONLY here, as the `DEEPGRAM_API_KEY` secret.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { audioSegments, mergeSegmentUtterances } from "./segments.ts";
@@ -46,7 +51,7 @@ Deno.serve(async (req) => {
     if (!user) return json({ error: "Unauthorized" }, 401);
 
     const admin = createClient(SUPABASE_URL, SERVICE_KEY);
-    const { meeting_id, deepgram_model, deepgram_language } = await req.json();
+    const { meeting_id, deepgram_model, deepgram_language, recording_mode } = await req.json();
     const model = deepgram_model || "nova-3";
     // A specific language pins transcription; "multi"/unset auto-detects the
     // dominant language (pre-recorded supports detect_language for any language).
@@ -55,13 +60,14 @@ Deno.serve(async (req) => {
     const { data: meeting, error: mErr } = await admin
       .from("meetings").select("*").eq("id", meeting_id).eq("user_id", user.id).single();
     if (mErr || !meeting) return json({ error: "Meeting not found" }, 404);
+    const inPerson = recording_mode === "in_person" || meeting.metadata?.recording_mode === "in_person";
     const segments = audioSegments(meeting);
     if (segments.length === 0) return json({ error: "Meeting has no audio_path" }, 400);
 
     const dgUrl = new URL("https://api.deepgram.com/v1/listen");
     const dgParams: Record<string, string> = {
       model,
-      multichannel: "true",
+      multichannel: inPerson ? "false" : "true",
       diarize: "true",
       punctuate: "true",
       numerals: "true",
@@ -101,8 +107,17 @@ Deno.serve(async (req) => {
       offset: r.offset,
       utterances: (r.dg?.results?.utterances ?? []) as any[],
     })));
+    // In person: one channel, every voice a participant, numbered by first
+    // appearance (Deepgram's indices can skip).
+    const partIndex = new Map<number, number>();
+    const roomLabel = (spk: number) => {
+      if (!partIndex.has(spk)) partIndex.set(spk, partIndex.size + 1);
+      return `Participant ${partIndex.get(spk)}`;
+    };
     const mapped = raw.map((u: any) => ({
-      speaker: (u.channel ?? 0) === 0 ? "You" : `Participant ${(u.speaker ?? 0) + 1}`,
+      speaker: inPerson
+        ? roomLabel(u.speaker ?? 0)
+        : (u.channel ?? 0) === 0 ? "You" : `Participant ${(u.speaker ?? 0) + 1}`,
       text: u.transcript ?? "",
       start: u.start ?? 0,
       end: u.end ?? 0,
@@ -145,6 +160,7 @@ Deno.serve(async (req) => {
       transcript,
       language,
       transcription_gaps: gaps.length ? gaps : undefined,
+      ...(inPerson ? { recording_mode: "in_person" } : {}),
     };
 
     await admin.from("meetings").update({

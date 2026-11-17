@@ -163,6 +163,14 @@ function upcomingRow(m) {
     }
   } else if (m.meet_url) {
     actions.append(iconBtn("join", "Open the call", () => chrome.tabs.create({ url: m.meet_url })));
+  } else if (state.phase === "idle" || state.phase === "done" || state.phase === "failed") {
+    // No Meet link: a meeting in a room. Record it from the microphone, with
+    // its calendar context — the company, the contacts, and the attendees'
+    // names the summary uses to tell who spoke.
+    const rec = btn("Record", "record-now", () => startInPerson({ title: m.title, calendar: calendarContext(m) }));
+    rec.prepend(icon("users", 15));
+    rec.title = "Record this in-person meeting from your microphone";
+    actions.append(rec);
   }
 
   row.append(chip, main, actions);
@@ -340,7 +348,8 @@ function renderTranscript() {
   // one (the batch pass may have re-diarized it) and allow renames.
   const saved = !recording && state.meetingId ? allMeetings().find((x) => x.id === state.meetingId) : null;
   if (saved && saved.transcript && saved.transcript.utterances && saved.transcript.utterances.length) {
-    renderBubbles(toBubbles(saved.transcript.utterances), "No transcript.", false, (from, to) => renameParticipant(saved, from, to));
+    renderBubbles(toBubbles(saved.transcript.utterances), "No transcript.", false, (from, to) => renameParticipant(saved, from, to), { canClaim: canClaimVoice(saved) });
+    claimHint(saved);
     return;
   }
   const bubbles = liveUtterances.slice();
@@ -348,7 +357,30 @@ function renderTranscript() {
     const it = interim[ch];
     if (it && it.text) bubbles.push({ channel: Number(ch), speaker: it.speaker, text: it.text, interim: true });
   }
-  renderBubbles(bubbles, recording ? "Listening… speech appears here as it's spoken." : "No transcript.", recording);
+  const roomLive = recording && state.mode === "in_person";
+  renderBubbles(
+    bubbles,
+    roomLive
+      ? "Listening to the room… speech appears here as it's spoken."
+      : recording ? "Listening… speech appears here as it's spoken." : "No transcript.",
+    recording,
+  );
+  if (roomLive && bubbles.length) {
+    $("transcript").prepend(noteLine("In person — live captions don't tell voices apart. Each speaker gets their own label once the meeting ends."));
+  }
+}
+
+function noteLine(textContent) {
+  const n = div("transcript-note");
+  n.textContent = textContent;
+  return n;
+}
+
+/** Above an in-person transcript nobody has claimed yet: how to say which
+ *  voice is yours, and who the others are. */
+function claimHint(m) {
+  if (!canClaimVoice(m)) return;
+  $("transcript").prepend(noteLine("In person — click a speaker's name to say who it is, or that it's you."));
 }
 
 function toBubbles(utts) {
@@ -360,7 +392,8 @@ function renderViewing(m) {
   if (!m.summary && activeTab === "summary") activeTab = "transcript";
   setTab(activeTab);
   const utts = (m.transcript && m.transcript.utterances) || [];
-  renderBubbles(toBubbles(utts), "No transcript for this meeting.", false, (from, to) => renameParticipant(m, from, to));
+  renderBubbles(toBubbles(utts), "No transcript for this meeting.", false, (from, to) => renameParticipant(m, from, to), { canClaim: canClaimVoice(m) });
+  claimHint(m);
   renderSummaryFor(m);
 }
 
@@ -372,8 +405,27 @@ function renderViewing(m) {
 const DIARIZED = /^Participant \d+$/i;
 function isDiarized(name) { return DIARIZED.test(String(name || "").trim()); }
 
+/** An in-person meeting: one room microphone, so the user's voice is one of
+ *  the diarized "Participant N" until they say which. Older meetings carry no
+ *  mode: a transcript with no "You" turn at all reads the same way. */
+function isInPerson(m) {
+  if (!m) return false;
+  if (m.mode === "in_person") return true;
+  if (m.mode === "call") return false;
+  return false;
+}
+
+/** Whether the user can still claim one of this meeting's voices as theirs. */
+function canClaimVoice(m) {
+  const utts = (m && m.transcript && m.transcript.utterances) || [];
+  return isInPerson(m) && utts.length > 0 && !utts.some((u) => u.speaker === "You");
+}
+
 function renameParticipant(m, from, to) {
   const next = String(to || "").trim();
+  // "You" is a claim, not a name: only in an in-person meeting nobody has
+  // claimed yet — a call's "You" is its own channel.
+  if (next === "You" && canClaimVoice(m)) return claimVoice(m, from);
   if (!m || !from || !next || next === from || next === "You") return;
   if (m.transcript && Array.isArray(m.transcript.utterances)) {
     m.transcript = {
@@ -392,18 +444,45 @@ function renameParticipant(m, from, to) {
   render();
 }
 
+/** "That's me": the voice becomes the user's — "You" in the transcript, and
+ *  its next steps the user's own (blue pill, at the top). */
+function claimVoice(m, from) {
+  if (!m || !from) return;
+  if (m.transcript && Array.isArray(m.transcript.utterances)) {
+    m.transcript = {
+      ...m.transcript,
+      utterances: m.transcript.utterances.map((u) => (u.speaker === from ? { ...u, speaker: "You" } : u)),
+    };
+  }
+  if (m.summary && Array.isArray(m.summary.next_steps)) {
+    const steps = m.summary.next_steps;
+    const userName = (steps.find((s) => s && s.is_user && s.owner && s.owner !== "You") || {}).owner ||
+      (session && session.email ? session.email.split("@")[0].replace(/^\w/, (c) => c.toUpperCase()) : "You");
+    for (const ns of steps) {
+      if (ns && ns.owner === from) { ns.owner = userName; ns.is_user = true; }
+    }
+    m.summary.next_steps = [...steps.filter((x) => x && x.is_user), ...steps.filter((x) => x && !x.is_user)];
+  }
+  for (const u of liveUtterances) if (u.speaker === from) u.speaker = "You";
+  persistMeetingEdit(m, { transcript: true, summary: !!m.summary });
+  render();
+}
+
 /** Turns a "Participant N" label into an inline input; Enter renames. */
-function inlineRename(labelEl, from, onRename) {
+function inlineRename(labelEl, from, onRename, { canClaim = false } = {}) {
   const input = document.createElement("input");
   input.type = "text";
   input.value = "";
-  input.placeholder = from;
+  input.placeholder = canClaim ? `${from} is… (a name)` : from;
+  // In person, the user's own voice is one of the participants: one click
+  // says which, instead of typing their name.
+  const wrap = canClaim ? span("rename-wrap") : null;
   let done = false;
-  const finish = (save) => {
+  const finish = (save, value) => {
     if (done) return; done = true;
-    const v = input.value.trim();
+    const v = value != null ? value : input.value.trim();
     if (save && v && v !== from) onRename(from, v);
-    else input.replaceWith(labelEl);
+    else (wrap || input).replaceWith(labelEl);
   };
   input.addEventListener("keydown", (e) => {
     e.stopPropagation();
@@ -412,7 +491,20 @@ function inlineRename(labelEl, from, onRename) {
   });
   input.addEventListener("blur", () => finish(true));
   input.addEventListener("click", (e) => e.stopPropagation());
-  labelEl.replaceWith(input);
+  if (wrap) {
+    const me = document.createElement("button");
+    me.type = "button";
+    me.className = "claim-voice";
+    me.textContent = "That's me";
+    me.title = `${from} is your voice: their lines become yours, and so do their next steps`;
+    // Keep the focus in the input: a blur would close the editor first.
+    me.addEventListener("mousedown", (e) => e.preventDefault());
+    me.addEventListener("click", (e) => { e.stopPropagation(); finish(true, "You"); });
+    wrap.append(input, me);
+    labelEl.replaceWith(wrap);
+  } else {
+    labelEl.replaceWith(input);
+  }
   input.focus();
 }
 
@@ -441,7 +533,7 @@ function coalesce(bubbles) {
   return out;
 }
 
-function renderBubbles(bubbles, emptyText, autoscroll, onRename) {
+function renderBubbles(bubbles, emptyText, autoscroll, onRename, { canClaim = false } = {}) {
   const box = $("transcript");
   const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 48;
   box.innerHTML = "";
@@ -455,7 +547,7 @@ function renderBubbles(bubbles, emptyText, autoscroll, onRename) {
       who.classList.add("renamable");
       who.title = "Rename this participant";
       who.append(icon("edit", 10));
-      who.addEventListener("click", () => inlineRename(who, b.speaker, onRename));
+      who.addEventListener("click", () => inlineRename(who, b.speaker, onRename, { canClaim }));
     }
     const t = document.createElement("div"); t.textContent = b.text;
     el.append(who, t); box.append(el);
@@ -545,7 +637,7 @@ function renderSummaryFor(m) {
           tail.append(taskToNotionBtn(m, ns));
         }
       }
-      item.append(cb, owner, task, tail);
+      item.append(cb, owner, task, tail, sendStepCell(m, ns));
       list.append(item);
     }
     s.append(h, list); box.append(s);
@@ -832,6 +924,196 @@ function taskToNotionBtn(m, ns) {
   return b;
 }
 
+// --- Next steps → Winday Data tasks --------------------------------------
+// Each next step carries, on hover, a button with Winday's mark: it puts the
+// step on the user's Tasks list in a Winday Data workspace they pick. The
+// service worker holds the Winday Data connection (lib/winday-data.js); a
+// step already sent keeps its mark, ticked, with where it went.
+
+let sentTasks = {};
+store.getSentTasks().then((v) => { sentTasks = v || {}; repaintSentButtons(); }).catch(() => {});
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.wn_sent_tasks) {
+    sentTasks = changes.wn_sent_tasks.newValue || {};
+    repaintSentButtons();
+  }
+});
+
+// The buttons on screen, by step key, to tick the one just sent.
+const sendButtons = new Map();
+function repaintSentButtons() {
+  for (const [key, b] of sendButtons) {
+    if (b.isConnected) paintSendButton(b, sentTasks[key]);
+    else sendButtons.delete(key);
+  }
+}
+
+function paintSendButton(b, sent) {
+  b.replaceChildren(icon("winday", 14));
+  if (sent) {
+    const tick = span("send-tick");
+    tick.append(icon("check", 11));
+    b.append(tick);
+  }
+  b.classList.toggle("sent", !!sent);
+  const label = sent
+    ? `Added to ${sent.workspaceName || "Winday Data"} — add it to another workspace`
+    : "Add as a task in Winday Data";
+  b.title = label;
+  b.setAttribute("aria-label", label);
+}
+
+/** A next step as a Winday Data task: its text as the title, the call it came from in the description. */
+function taskFromStep(m, ns, isUserStep) {
+  const full = String(ns.task || "").replace(/\s+/g, " ").trim();
+  const title = full.length <= 200 ? full : full.slice(0, 199).replace(/\s+\S*$/, "") + "…";
+  const lines = [];
+  if (title !== full) lines.push(full, "");
+  const when = m && m.startedAt
+    ? new Date(m.startedAt).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" })
+    : null;
+  const company = m && m.calendar && m.calendar.companyName;
+  const call = (m && m.title) || "a call";
+  lines.push(`Next step from the call "${call}"${when ? ` on ${when}` : ""}${company ? ` with ${company}` : ""}.`);
+  lines.push(`Owner: ${ns.owner || (isUserStep ? "You" : "Participant")}.`);
+  if (m && m.id) lines.push(`Call notes: ${crmURL(m)} (Winday CRM meeting ${m.id}).`);
+  return { title, description: lines.join("\n") };
+}
+
+function sendStepCell(m, ns) {
+  const cell = span("todo-send");
+  const key = store.sentTaskKey(m && m.id, ns.task);
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "send-task";
+  paintSendButton(b, sentTasks[key]);
+  sendButtons.set(key, b);
+  b.addEventListener("click", (e) => {
+    // Inside the step's <label>: never tick its checkbox.
+    e.preventDefault();
+    e.stopPropagation();
+    toggleStepMenu(cell, b, m, ns, key);
+  });
+  cell.append(b);
+  return cell;
+}
+
+function toggleStepMenu(cell, b, m, ns, key) {
+  const wasOurs = openMenu && openMenu._btn === b;
+  closeMenu();
+  if (wasOurs) return;
+  const menu = div("row-menu task-menu");
+  menu._btn = b;
+  // Clicks inside the menu stay in it: the step's <label> would take them.
+  menu.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); });
+  const head = div("task-menu-head");
+  head.textContent = sentTasks[key] ? `Added to ${sentTasks[key].workspaceName || "Winday Data"}` : "Add to Winday Data";
+  const body = div("task-menu-body");
+  menu.append(head, body);
+  cell.append(menu);
+  openMenu = menu;
+  b.classList.add("open");
+  fillStepMenu(menu, body, b, m, ns, key);
+}
+
+function menuNote(textContent, cls = "task-menu-note") {
+  const n = div(cls);
+  n.textContent = textContent;
+  return n;
+}
+
+function menuAction(label, onClick, cls = "") {
+  const a = document.createElement("button");
+  a.type = "button";
+  a.className = cls;
+  a.textContent = label;
+  a.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); onClick(a); });
+  return a;
+}
+
+async function fillStepMenu(menu, body, b, m, ns, key) {
+  body.replaceChildren(menuNote("Loading your workspaces…"));
+  let r;
+  try {
+    r = await chrome.runtime.sendMessage({ type: "WN_DATA_WORKSPACES" });
+  } catch (e) {
+    r = { ok: false, error: String(e && e.message || e) };
+  }
+  if (openMenu !== menu) return; // closed meanwhile
+
+  if (!r || !r.ok) {
+    if (r && r.code === "not_connected") {
+      body.replaceChildren(
+        menuNote("Connect Winday Data to send this call's next steps to your Tasks list. It only gets access to your workspaces and tasks."),
+        menuAction("Connect Winday Data", async (a) => {
+          a.disabled = true;
+          a.textContent = "Waiting for Winday Data…";
+          const c = await chrome.runtime.sendMessage({ type: "WN_DATA_CONNECT" }).catch((e) => ({ ok: false, error: String(e) }));
+          if (openMenu !== menu) return;
+          if (c && c.ok) fillStepMenu(menu, body, b, m, ns, key);
+          else {
+            a.disabled = false;
+            a.textContent = "Connect Winday Data";
+            body.prepend(menuNote((c && c.error) || "Could not connect.", "task-menu-error"));
+          }
+        }, "primary-action"),
+      );
+      return;
+    }
+    body.replaceChildren(
+      menuNote((r && r.error) || "Winday Data could not be reached.", "task-menu-error"),
+      menuAction("Try again", () => fillStepMenu(menu, body, b, m, ns, key)),
+    );
+    return;
+  }
+
+  if (!r.tasksEnabled) {
+    body.replaceChildren(menuNote("Tasks is not available on your Winday Data account yet."));
+    return;
+  }
+  const usable = (r.workspaces || []).filter((w) => w.can_add_tasks);
+  if (!usable.length) {
+    body.replaceChildren(menuNote("You don't edit any Winday Data workspace yet."));
+    return;
+  }
+
+  const list = div("task-menu-list");
+  for (const w of usable) {
+    const label = w.id === (sentTasks[key] && sentTasks[key].workspaceId) ? `${w.name} ✓` : w.name;
+    list.append(menuAction(label, (a) => createStepTask(menu, body, a, b, m, ns, key, w)));
+  }
+  const foot = div("task-menu-foot");
+  foot.append(menuAction("Disconnect Winday Data", async () => {
+    await chrome.runtime.sendMessage({ type: "WN_DATA_DISCONNECT" }).catch(() => {});
+    if (openMenu === menu) fillStepMenu(menu, body, b, m, ns, key);
+  }, "foot-action"));
+  body.replaceChildren(list, foot);
+}
+
+async function createStepTask(menu, body, a, b, m, ns, key, w) {
+  for (const other of body.querySelectorAll("button")) other.disabled = true;
+  a.textContent = `Adding to ${w.name}…`;
+  const isUserStep = ns.is_user === true || ns.owner === "You";
+  const { title, description } = taskFromStep(m, ns, isUserStep);
+  const r = await chrome.runtime
+    .sendMessage({ type: "WN_DATA_CREATE_TASK", key, workspaceId: w.id, workspaceName: w.name, title, description })
+    .catch((e) => ({ ok: false, error: String(e) }));
+  if (r && r.ok) {
+    sentTasks = { ...sentTasks, [key]: r.sent };
+    paintSendButton(b, r.sent);
+    if (openMenu === menu) {
+      body.replaceChildren(menuNote(`Added to ${w.name}'s Tasks in Winday Data.`, "task-menu-done"));
+      setTimeout(() => { if (openMenu === menu) closeMenu(); }, 1400);
+    }
+    return;
+  }
+  if (openMenu !== menu) return;
+  if (r && r.code === "not_connected") return fillStepMenu(menu, body, b, m, ns, key);
+  for (const other of body.querySelectorAll("button")) other.disabled = false;
+  a.textContent = w.name;
+  body.prepend(menuNote((r && r.error) || "The task could not be added.", "task-menu-error"));
+}
+
 // --- Bottom bar ----------------------------------------------------------
 
 function renderBottomBar() {
@@ -855,11 +1137,44 @@ function renderBottomBar() {
     s.append(span("spinner"), text(stageLabel(state.stage)));
     bar.append(s);
   } else {
-    // idle / done / failed → start a (new) recording
-    const start = btn("Start Recording", "start", startRecording);
-    start.prepend(icon("mic", 20));
-    bar.append(start);
+    // idle / done / failed → start a (new) recording: the Meet call in this
+    // window, or an in-person meeting from the microphone alone.
+    bar.append(startButtons());
   }
+}
+
+/** The two ways to start: a Meet call (the tab's audio + your mic), or an
+ *  in-person meeting (the room's microphone, no tab at all). */
+function startButtons() {
+  const row = div("start-row");
+  const start = btn("Start Recording", "start", startRecording);
+  start.prepend(icon("mic", 20));
+  start.title = "Record the Google Meet call in this window";
+  const room = btn("In person", "start in-person", () => startInPerson());
+  room.prepend(icon("users", 18));
+  room.title = "Record a meeting in the room, from your microphone — no call needed";
+  row.append(start, room);
+  return row;
+}
+
+/** Records an in-person meeting: the microphone only, wherever this panel is
+ *  open. `arg` may carry a Today row's title and calendar context. */
+async function startInPerson(arg) {
+  // The recorder (offscreen) cannot ask for the microphone itself: the
+  // browser's prompt has to come from here, the first time.
+  if (!micGranted) {
+    try {
+      await requestMicPermission();
+      micGranted = true;
+    } catch (e) {
+      return recorderHint("Allow the microphone to record an in-person meeting (" + String(e?.message || e) + ").");
+    }
+  }
+  const ctx = arg && arg.calendar ? arg : null;
+  const r = await chrome.runtime
+    .sendMessage({ type: "WN_RECORD_IN_PERSON", title: ctx ? ctx.title : undefined, calendar: ctx ? ctx.calendar : undefined })
+    .catch((e) => ({ ok: false, error: String(e?.message || e) }));
+  if (!r?.ok) recorderHint(r?.error || "Couldn't start the recording.");
 }
 
 function renderViz() {
@@ -969,7 +1284,11 @@ function itemRow(m) {
 // or Escape closes it.
 let openMenu = null;
 function closeMenu() {
-  if (openMenu) { openMenu.remove(); openMenu = null; }
+  if (openMenu) {
+    if (openMenu._btn) openMenu._btn.classList.remove("open");
+    openMenu.remove();
+    openMenu = null;
+  }
 }
 document.addEventListener("click", (e) => {
   if (openMenu && !openMenu.contains(e.target) && !openMenu._btn.contains(e.target)) closeMenu();
@@ -1167,17 +1486,14 @@ function recorderHint(msg, isError = true) {
   t.textContent = msg;
   s.append(t);
   bar.append(s);
-  if (isError) {
-    const start = btn("Start Recording", "start", startRecording);
-    start.prepend(icon("mic", 20));
-    bar.append(start);
-  }
+  if (isError) bar.append(startButtons());
 }
 
 // --- Helpers -------------------------------------------------------------
 
 function subtitle(m) {
   const parts = [];
+  if (isInPerson(m)) parts.push("In person");
   if (m.calendar?.companyName) parts.push(m.calendar.companyName);
   if (m.startedAt) parts.push(new Date(m.startedAt).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }));
   if (m.endedAt && m.startedAt) {
@@ -1381,7 +1697,13 @@ paintIcons();
 
 // Tabs. Both panes are always kept rendered by renderSession/renderViewing;
 // switching tabs only toggles which one is visible.
-$("tab-btn-transcript").addEventListener("click", () => { setTab("transcript"); renderTranscript(); });
+// A past meeting opened from the list shows ITS transcript (renderViewing,
+// through render) — the live one would read "No transcript." over it.
+$("tab-btn-transcript").addEventListener("click", () => {
+  setTab("transcript");
+  if (viewingId) render();
+  else renderTranscript();
+});
 $("tab-btn-summary").addEventListener("click", () => {
   if ($("tab-btn-summary").disabled) return;
   setTab("summary");

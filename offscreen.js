@@ -82,7 +82,19 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
 });
 
-async function startRecording({ streamId, meeting, session, settings }) {
+async function startRecording({ streamId, inPerson, meeting, session, settings }) {
+  if (inPerson) {
+    // An in-person meeting: no call tab, only the room's microphone, tuned
+    // for voices around a table (capture.js, MIC_PROFILES.room). Recorded
+    // here, so it survives the panel closing and any tab switch.
+    const micStream = await acquireMic("room");
+    if (!micStream) {
+      throw new Error("Allow the microphone to record an in-person meeting — use the banner in the panel, then try again.");
+    }
+    recorder = createRecorder();
+    await recorder.start({ micStream, inPerson: true, meeting, session, settings });
+    return;
+  }
   // Tab audio (the remote participants) minted by chrome.tabCapture.
   const tabStream = await navigator.mediaDevices.getUserMedia({
     audio: {

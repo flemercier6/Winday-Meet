@@ -397,6 +397,27 @@ a.linkbtn:hover, button.linkbtn:hover { background: var(--bg-surface-hover); }
   padding: 13px 16px; font-size: 15px; border-radius: var(--radius-md); flex: none;
 }
 .bottombar .start:hover { background: var(--bg-inverse-hover); }
+/* Two ways to start: the Meet call (primary), or a meeting in the room. */
+.bottombar .start-row { display: flex; gap: 8px; }
+.bottombar .start-row .start { flex: 1; width: auto; }
+.bottombar .start.in-person {
+  flex: none; padding: 13px 14px; font-size: 14px;
+  background: var(--bg-surface); color: var(--text-primary);
+  border: 1px solid var(--border-default);
+}
+.bottombar .start.in-person:hover { background: var(--bg-surface-hover); }
+
+/* In person: a line above the transcript, and the "That's me" claim. */
+.transcript-note {
+  align-self: stretch; font-size: 12px; line-height: 16px; color: var(--text-secondary);
+  background: var(--bg-inset); border-radius: var(--radius-sm); padding: 7px 10px;
+}
+.rename-wrap { display: inline-flex; align-items: center; gap: 6px; }
+.rename-wrap button.claim-voice {
+  flex: none; font-size: 11px; line-height: 16px; font-weight: 600; padding: 2px 8px;
+  border-radius: var(--radius-full); background: var(--info-subtle); color: var(--info-on-subtle);
+}
+.rename-wrap button.claim-voice:hover { filter: brightness(0.96); }
 .rec-controls { display: flex; align-items: center; gap: 10px; }
 .rec-controls .stop-btn { flex: none; display: inline-flex; align-items: center; gap: 6px; background: var(--danger); color: #fff; border-radius: var(--radius-md); padding: 11px 16px; }
 .rec-controls .stop-btn:hover { background: #9d4636; }

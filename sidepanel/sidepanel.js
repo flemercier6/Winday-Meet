@@ -163,6 +163,14 @@ function upcomingRow(m) {
     }
   } else if (m.meet_url) {
     actions.append(iconBtn("join", "Open the call", () => chrome.tabs.create({ url: m.meet_url })));
+  } else if (state.phase === "idle" || state.phase === "done" || state.phase === "failed") {
+    // No Meet link: a meeting in a room. Record it from the microphone, with
+    // its calendar context — the company, the contacts, and the attendees'
+    // names the summary uses to tell who spoke.
+    const rec = btn("Record", "record-now", () => startInPerson({ title: m.title, calendar: calendarContext(m) }));
+    rec.prepend(icon("users", 15));
+    rec.title = "Record this in-person meeting from your microphone";
+    actions.append(rec);
   }
 
   row.append(chip, main, actions);
@@ -340,7 +348,8 @@ function renderTranscript() {
   // one (the batch pass may have re-diarized it) and allow renames.
   const saved = !recording && state.meetingId ? allMeetings().find((x) => x.id === state.meetingId) : null;
   if (saved && saved.transcript && saved.transcript.utterances && saved.transcript.utterances.length) {
-    renderBubbles(toBubbles(saved.transcript.utterances), "No transcript.", false, (from, to) => renameParticipant(saved, from, to));
+    renderBubbles(toBubbles(saved.transcript.utterances), "No transcript.", false, (from, to) => renameParticipant(saved, from, to), { canClaim: canClaimVoice(saved) });
+    claimHint(saved);
     return;
   }
   const bubbles = liveUtterances.slice();
@@ -348,7 +357,30 @@ function renderTranscript() {
     const it = interim[ch];
     if (it && it.text) bubbles.push({ channel: Number(ch), speaker: it.speaker, text: it.text, interim: true });
   }
-  renderBubbles(bubbles, recording ? "Listening… speech appears here as it's spoken." : "No transcript.", recording);
+  const roomLive = recording && state.mode === "in_person";
+  renderBubbles(
+    bubbles,
+    roomLive
+      ? "Listening to the room… speech appears here as it's spoken."
+      : recording ? "Listening… speech appears here as it's spoken." : "No transcript.",
+    recording,
+  );
+  if (roomLive && bubbles.length) {
+    $("transcript").prepend(noteLine("In person — live captions don't tell voices apart. Each speaker gets their own label once the meeting ends."));
+  }
+}
+
+function noteLine(textContent) {
+  const n = div("transcript-note");
+  n.textContent = textContent;
+  return n;
+}
+
+/** Above an in-person transcript nobody has claimed yet: how to say which
+ *  voice is yours, and who the others are. */
+function claimHint(m) {
+  if (!canClaimVoice(m)) return;
+  $("transcript").prepend(noteLine("In person — click a speaker's name to say who it is, or that it's you."));
 }
 
 function toBubbles(utts) {
@@ -360,7 +392,8 @@ function renderViewing(m) {
   if (!m.summary && activeTab === "summary") activeTab = "transcript";
   setTab(activeTab);
   const utts = (m.transcript && m.transcript.utterances) || [];
-  renderBubbles(toBubbles(utts), "No transcript for this meeting.", false, (from, to) => renameParticipant(m, from, to));
+  renderBubbles(toBubbles(utts), "No transcript for this meeting.", false, (from, to) => renameParticipant(m, from, to), { canClaim: canClaimVoice(m) });
+  claimHint(m);
   renderSummaryFor(m);
 }
 
@@ -372,8 +405,27 @@ function renderViewing(m) {
 const DIARIZED = /^Participant \d+$/i;
 function isDiarized(name) { return DIARIZED.test(String(name || "").trim()); }
 
+/** An in-person meeting: one room microphone, so the user's voice is one of
+ *  the diarized "Participant N" until they say which. Older meetings carry no
+ *  mode: a transcript with no "You" turn at all reads the same way. */
+function isInPerson(m) {
+  if (!m) return false;
+  if (m.mode === "in_person") return true;
+  if (m.mode === "call") return false;
+  return false;
+}
+
+/** Whether the user can still claim one of this meeting's voices as theirs. */
+function canClaimVoice(m) {
+  const utts = (m && m.transcript && m.transcript.utterances) || [];
+  return isInPerson(m) && utts.length > 0 && !utts.some((u) => u.speaker === "You");
+}
+
 function renameParticipant(m, from, to) {
   const next = String(to || "").trim();
+  // "You" is a claim, not a name: only in an in-person meeting nobody has
+  // claimed yet — a call's "You" is its own channel.
+  if (next === "You" && canClaimVoice(m)) return claimVoice(m, from);
   if (!m || !from || !next || next === from || next === "You") return;
   if (m.transcript && Array.isArray(m.transcript.utterances)) {
     m.transcript = {
@@ -392,18 +444,45 @@ function renameParticipant(m, from, to) {
   render();
 }
 
+/** "That's me": the voice becomes the user's — "You" in the transcript, and
+ *  its next steps the user's own (blue pill, at the top). */
+function claimVoice(m, from) {
+  if (!m || !from) return;
+  if (m.transcript && Array.isArray(m.transcript.utterances)) {
+    m.transcript = {
+      ...m.transcript,
+      utterances: m.transcript.utterances.map((u) => (u.speaker === from ? { ...u, speaker: "You" } : u)),
+    };
+  }
+  if (m.summary && Array.isArray(m.summary.next_steps)) {
+    const steps = m.summary.next_steps;
+    const userName = (steps.find((s) => s && s.is_user && s.owner && s.owner !== "You") || {}).owner ||
+      (session && session.email ? session.email.split("@")[0].replace(/^\w/, (c) => c.toUpperCase()) : "You");
+    for (const ns of steps) {
+      if (ns && ns.owner === from) { ns.owner = userName; ns.is_user = true; }
+    }
+    m.summary.next_steps = [...steps.filter((x) => x && x.is_user), ...steps.filter((x) => x && !x.is_user)];
+  }
+  for (const u of liveUtterances) if (u.speaker === from) u.speaker = "You";
+  persistMeetingEdit(m, { transcript: true, summary: !!m.summary });
+  render();
+}
+
 /** Turns a "Participant N" label into an inline input; Enter renames. */
-function inlineRename(labelEl, from, onRename) {
+function inlineRename(labelEl, from, onRename, { canClaim = false } = {}) {
   const input = document.createElement("input");
   input.type = "text";
   input.value = "";
-  input.placeholder = from;
+  input.placeholder = canClaim ? `${from} is… (a name)` : from;
+  // In person, the user's own voice is one of the participants: one click
+  // says which, instead of typing their name.
+  const wrap = canClaim ? span("rename-wrap") : null;
   let done = false;
-  const finish = (save) => {
+  const finish = (save, value) => {
     if (done) return; done = true;
-    const v = input.value.trim();
+    const v = value != null ? value : input.value.trim();
     if (save && v && v !== from) onRename(from, v);
-    else input.replaceWith(labelEl);
+    else (wrap || input).replaceWith(labelEl);
   };
   input.addEventListener("keydown", (e) => {
     e.stopPropagation();
@@ -412,7 +491,20 @@ function inlineRename(labelEl, from, onRename) {
   });
   input.addEventListener("blur", () => finish(true));
   input.addEventListener("click", (e) => e.stopPropagation());
-  labelEl.replaceWith(input);
+  if (wrap) {
+    const me = document.createElement("button");
+    me.type = "button";
+    me.className = "claim-voice";
+    me.textContent = "That's me";
+    me.title = `${from} is your voice: their lines become yours, and so do their next steps`;
+    // Keep the focus in the input: a blur would close the editor first.
+    me.addEventListener("mousedown", (e) => e.preventDefault());
+    me.addEventListener("click", (e) => { e.stopPropagation(); finish(true, "You"); });
+    wrap.append(input, me);
+    labelEl.replaceWith(wrap);
+  } else {
+    labelEl.replaceWith(input);
+  }
   input.focus();
 }
 
@@ -441,7 +533,7 @@ function coalesce(bubbles) {
   return out;
 }
 
-function renderBubbles(bubbles, emptyText, autoscroll, onRename) {
+function renderBubbles(bubbles, emptyText, autoscroll, onRename, { canClaim = false } = {}) {
   const box = $("transcript");
   const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 48;
   box.innerHTML = "";
@@ -455,7 +547,7 @@ function renderBubbles(bubbles, emptyText, autoscroll, onRename) {
       who.classList.add("renamable");
       who.title = "Rename this participant";
       who.append(icon("edit", 10));
-      who.addEventListener("click", () => inlineRename(who, b.speaker, onRename));
+      who.addEventListener("click", () => inlineRename(who, b.speaker, onRename, { canClaim }));
     }
     const t = document.createElement("div"); t.textContent = b.text;
     el.append(who, t); box.append(el);
@@ -1045,11 +1137,44 @@ function renderBottomBar() {
     s.append(span("spinner"), text(stageLabel(state.stage)));
     bar.append(s);
   } else {
-    // idle / done / failed → start a (new) recording
-    const start = btn("Start Recording", "start", startRecording);
-    start.prepend(icon("mic", 20));
-    bar.append(start);
+    // idle / done / failed → start a (new) recording: the Meet call in this
+    // window, or an in-person meeting from the microphone alone.
+    bar.append(startButtons());
   }
+}
+
+/** The two ways to start: a Meet call (the tab's audio + your mic), or an
+ *  in-person meeting (the room's microphone, no tab at all). */
+function startButtons() {
+  const row = div("start-row");
+  const start = btn("Start Recording", "start", startRecording);
+  start.prepend(icon("mic", 20));
+  start.title = "Record the Google Meet call in this window";
+  const room = btn("In person", "start in-person", () => startInPerson());
+  room.prepend(icon("users", 18));
+  room.title = "Record a meeting in the room, from your microphone — no call needed";
+  row.append(start, room);
+  return row;
+}
+
+/** Records an in-person meeting: the microphone only, wherever this panel is
+ *  open. `arg` may carry a Today row's title and calendar context. */
+async function startInPerson(arg) {
+  // The recorder (offscreen) cannot ask for the microphone itself: the
+  // browser's prompt has to come from here, the first time.
+  if (!micGranted) {
+    try {
+      await requestMicPermission();
+      micGranted = true;
+    } catch (e) {
+      return recorderHint("Allow the microphone to record an in-person meeting (" + String(e?.message || e) + ").");
+    }
+  }
+  const ctx = arg && arg.calendar ? arg : null;
+  const r = await chrome.runtime
+    .sendMessage({ type: "WN_RECORD_IN_PERSON", title: ctx ? ctx.title : undefined, calendar: ctx ? ctx.calendar : undefined })
+    .catch((e) => ({ ok: false, error: String(e?.message || e) }));
+  if (!r?.ok) recorderHint(r?.error || "Couldn't start the recording.");
 }
 
 function renderViz() {
@@ -1361,17 +1486,14 @@ function recorderHint(msg, isError = true) {
   t.textContent = msg;
   s.append(t);
   bar.append(s);
-  if (isError) {
-    const start = btn("Start Recording", "start", startRecording);
-    start.prepend(icon("mic", 20));
-    bar.append(start);
-  }
+  if (isError) bar.append(startButtons());
 }
 
 // --- Helpers -------------------------------------------------------------
 
 function subtitle(m) {
   const parts = [];
+  if (isInPerson(m)) parts.push("In person");
   if (m.calendar?.companyName) parts.push(m.calendar.companyName);
   if (m.startedAt) parts.push(new Date(m.startedAt).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }));
   if (m.endedAt && m.startedAt) {
@@ -1575,7 +1697,13 @@ paintIcons();
 
 // Tabs. Both panes are always kept rendered by renderSession/renderViewing;
 // switching tabs only toggles which one is visible.
-$("tab-btn-transcript").addEventListener("click", () => { setTab("transcript"); renderTranscript(); });
+// A past meeting opened from the list shows ITS transcript (renderViewing,
+// through render) — the live one would read "No transcript." over it.
+$("tab-btn-transcript").addEventListener("click", () => {
+  setTab("transcript");
+  if (viewingId) render();
+  else renderTranscript();
+});
 $("tab-btn-summary").addEventListener("click", () => {
   if ($("tab-btn-summary").disabled) return;
   setTab("summary");

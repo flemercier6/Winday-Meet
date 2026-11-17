@@ -21,6 +21,12 @@
 // fails is skipped (and listed in metadata.transcription_gaps) as long as
 // another one produced speech: half the notes beat none.
 //
+// In-person meetings (`recording_mode: "in_person"`, in the request or the
+// row's metadata): ONE room microphone, mono — nobody is on a "You" channel,
+// every voice is diarized into Participant 1..N (the user claims theirs in the
+// extension, or summarize identifies it). Gladia is told to expect a room
+// (2–8 speakers, hints only). Calls are unchanged.
+//
 // The Gladia API key lives ONLY here, as the `GLADIA_API_KEY` secret.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { audioSegments, mergeSegmentUtterances } from "./segments.ts";
@@ -56,12 +62,13 @@ Deno.serve(async (req) => {
     if (!user) return json({ error: "Unauthorized" }, 401);
 
     const admin = createClient(SUPABASE_URL, SERVICE_KEY);
-    const { meeting_id, language: reqLanguage } = await req.json();
+    const { meeting_id, language: reqLanguage, recording_mode } = await req.json();
     const lang = reqLanguage && reqLanguage !== "multi" ? reqLanguage : null;
 
     const { data: meeting, error: mErr } = await admin
       .from("meetings").select("*").eq("id", meeting_id).eq("user_id", user.id).single();
     if (mErr || !meeting) return json({ error: "Meeting not found" }, 404);
+    const inPerson = recording_mode === "in_person" || meeting.metadata?.recording_mode === "in_person";
     const segments = audioSegments(meeting);
     if (segments.length === 0) return json({ error: "Meeting has no audio_path" }, 400);
 
@@ -71,7 +78,7 @@ Deno.serve(async (req) => {
         const { data: signed, error: sErr } = await admin.storage
           .from("recordings").createSignedUrl(seg.path, 3600);
         if (sErr || !signed) throw new Error(`Could not sign audio URL (${seg.path})`);
-        const resultUrl = await gladiaInit(signed.signedUrl, lang);
+        const resultUrl = await gladiaInit(signed.signedUrl, lang, inPerson);
         return { index, offset: seg.offset, resultUrl, result: null as any, error: null as string | null };
       } catch (e) {
         return { index, offset: seg.offset, resultUrl: null, result: null as any, error: String((e as Error)?.message ?? e) };
@@ -120,7 +127,8 @@ Deno.serve(async (req) => {
     // Across segments a diarization index is taken to be the same person —
     // exact for the usual 1:1 call (one remote voice); with several remote
     // speakers, labels after a segment boundary may swap.
-    const hasChannels = raw.some((u: any) => (u.channel ?? 0) > 0);
+    // In person there is no "You" channel to find, whatever the file holds.
+    const hasChannels = !inPerson && raw.some((u: any) => (u.channel ?? 0) > 0);
     const partIndex = new Map<string, number>();
     const participantLabel = (key: string) => {
       if (!partIndex.has(key)) partIndex.set(key, partIndex.size + 1);
@@ -174,6 +182,7 @@ Deno.serve(async (req) => {
       transcript,
       language,
       transcription_provider: "gladia",   // A/B marker: which engine made this transcript
+      ...(inPerson ? { recording_mode: "in_person" } : {}),
       // Segments that could not be transcribed (absent when every one was).
       transcription_gaps: gaps.length ? gaps : undefined,
     };
@@ -193,7 +202,7 @@ Deno.serve(async (req) => {
 
 /** Starts one async Gladia job; returns its result URL. Retries briefly on
  *  429/503 — several segments start at once and may hit a concurrency cap. */
-async function gladiaInit(audioUrl: string, lang: string | null): Promise<string> {
+async function gladiaInit(audioUrl: string, lang: string | null, inPerson = false): Promise<string> {
   let lastErr = "";
   for (let attempt = 0; attempt < 4; attempt++) {
     if (attempt) await new Promise((r) => setTimeout(r, 2000 * attempt));
@@ -203,6 +212,9 @@ async function gladiaInit(audioUrl: string, lang: string | null): Promise<string
       body: JSON.stringify({
         audio_url: audioUrl,
         diarization: true,
+        // A room: at least two voices, rarely more than eight around a table.
+        // Hints, not limits (Gladia's diarization_config).
+        ...(inPerson ? { diarization_config: { min_speakers: 2, max_speakers: 8 } } : {}),
         language_config: {
           languages: lang ? [lang] : [],   // [] = auto-detect any language
           code_switching: !lang,           // allow mid-call language changes when auto

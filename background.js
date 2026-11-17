@@ -34,6 +34,7 @@ let state = {
   error: null,
   recorderHost: null, // "offscreen" | "panel" while recording
   recordingTabId: null, // the Meet tab being captured, while recording
+  mode: null, // "call" | "in_person" — what is being recorded
   imminentCall: null, // {title, meet_url, start} from the calendar, for the pill
   panelOpen: false, // a NATIVE side panel is open somewhere (pill hides itself)
 };
@@ -288,6 +289,17 @@ async function handle(msg, sender) {
       }
     }
 
+    // An in-person meeting: no call tab to capture, only the microphone. It
+    // records in the offscreen document like the silent path, from any tab
+    // (or none), and no Meet tab closing or call ending can stop it.
+    case "WN_RECORD_IN_PERSON":
+      return beginRecording({
+        inPerson: true,
+        title: msg.title,
+        calendar: msg.calendar,
+        tabId: null,
+      });
+
     // The NATIVE side panel refuses to host a fallback recording (the capture
     // dies with the panel document): dock the panel iframe in the call's tab,
     // bring that tab forward, and let the user start the capture from there —
@@ -507,17 +519,20 @@ function mergeForRetry(local, remote) {
   };
 }
 
-/** Starts an offscreen (silent-path) recording from a tabCapture stream id. */
-async function beginRecording({ streamId, title, calendar, tabId }) {
+/** Starts an offscreen recording: a call from a tabCapture stream id (the
+ *  silent path), or an in-person meeting from the microphone alone. */
+async function beginRecording({ streamId, inPerson, title, calendar, tabId }) {
   if (state.phase === "recording") return { ok: false, error: "Already recording." };
   const session = await store.getSession();
   if (!session) return { ok: false, error: "Sign in first." };
   const settings = await store.getSettings();
   const meeting = {
     id: crypto.randomUUID(),
+    // "Meeting …" is replaced by the summary's headline once it is written.
     title: title || `Meeting ${new Date().toLocaleString()}`,
     startedAt: new Date().toISOString(),
     calendar: calendar || null,
+    mode: inPerson ? "in_person" : "call",
   };
   clearCallEndedTimer(); // a leftover grace timer must not end THIS recording
   await ensureOffscreen();
@@ -531,8 +546,9 @@ async function beginRecording({ streamId, title, calendar, tabId }) {
     error: null,
     recorderHost: "offscreen",
     recordingTabId: tabId ?? null,
+    mode: meeting.mode,
   });
-  await sendToOffscreen({ type: "START", streamId, meeting, session, settings });
+  await sendToOffscreen({ type: "START", streamId, inPerson: !!inPerson, meeting, session, settings });
   return { ok: true, meetingId: meeting.id };
 }
 

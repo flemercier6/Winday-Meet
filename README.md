@@ -125,6 +125,40 @@ Works in **Chrome**, **Dia** and **Arc**. The panel has two display modes
    name and its full-name twin show once. Everything is saved with the
    meeting, on every device.
 
+### In-person meetings (no call, just the room)
+
+For a meeting around a table, press **In person** next to *Start Recording*
+(no Google Meet tab needed, from any tab or none). The extension records the
+**microphone alone**, mono, tuned for a room: no echo cancellation or noise
+suppression (they eat distant voices), automatic gain on. It records in the
+offscreen document, so closing the panel or switching tabs never stops it, and
+no "call ended" signal can either — press **Stop** when the meeting is over.
+
+- **Live captions** show what is said, but cannot reliably tell voices apart
+  (and Gladia live has no diarization at all).
+- **The saved transcript always comes from the batch pass** over the whole
+  recording, whatever the engine: Gladia (told to expect 2–8 speakers) or
+  Deepgram (`multichannel=false`) diarizes the room into *Participant 1, 2, …*.
+- **Who is who**: `summarize` is told the meeting was in person, identifies
+  your voice when the conversation makes it clear (you introduce yourself, are
+  addressed by name) and names the others from the attendees or from names
+  said aloud — checked server-side, never invented. When it is not sure, open
+  the transcript, click a speaker's label and choose **That's me** (your lines
+  become "You", their next steps yours) or type their name.
+- A row of **Today** without a Meet link gets its own **Record** button for an
+  in-person recording with the event's company and contacts — once the
+  `upcoming-meetings` function returns such events (today it returns calls
+  with a Meet link only).
+
+Quality depends on the room: a laptop in the middle of a table of 2–5 people
+works well; for more people or a large room, an external conference mic makes
+the difference.
+
+The mode travels as `recording_mode: "in_person"` — on the meeting
+(`meetings.metadata.recording_mode`) and in the calls to `transcribe`,
+`transcribe-gladia` and `summarize`. Without it, every function behaves
+exactly as before.
+
 ### Which company was that call with?
 
 `enrich-meeting` links each meeting to a CRM company, most reliable signal

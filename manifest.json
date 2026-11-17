@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Winday Meet",
-  "version": "1.23.2",
+  "version": "1.24.0",
   "minimum_chrome_version": "116",
   "description": "Records your Google Meet calls, transcribes them with Deepgram, summarizes them with Gemini, and pushes the notes to the Winday CRM + Notion.",
   "action": {
@@ -33,12 +33,14 @@
     "scripting",
     "contextMenus",
     "sidePanel",
-    "alarms"
+    "alarms",
+    "identity"
   ],
   "host_permissions": [
     "https://gagfovgnuttmngnhqzwd.supabase.co/*",
     "https://meet.google.com/*",
-    "https://crm.winday.app/*"
+    "https://crm.winday.app/*",
+    "https://data.winday.app/*"
   ],
   "content_scripts": [
     {

@@ -14,6 +14,7 @@ import * as store from "./lib/store.js";
 import * as sb from "./lib/supabase.js";
 import { STAGE_LABELS } from "./lib/pipeline.js";
 import * as unsent from "./lib/unsent.js";
+import * as windayData from "./lib/winday-data.js";
 
 const OFFSCREEN_PATH = "offscreen.html";
 // The Winday CRM web app (same Supabase project as the extension) — used for
@@ -223,6 +224,50 @@ async function handle(msg, sender) {
       }
       return { ok: true };
     }
+
+    // --- Winday Data: a call's next steps → the user's Tasks list ---
+    // The OAuth link lives here (chrome.identity is a service-worker API);
+    // the panel asks for the workspaces and sends each step it is told to.
+    case "WN_DATA_CONNECT": {
+      try {
+        await windayData.connect();
+        return { ok: true, ...(await windayWorkspaces()) };
+      } catch (e) {
+        return dataError(e);
+      }
+    }
+
+    case "WN_DATA_WORKSPACES": {
+      try {
+        if (!(await windayData.isConnected())) return { ok: false, code: "not_connected" };
+        return { ok: true, ...(await windayWorkspaces()) };
+      } catch (e) {
+        return dataError(e);
+      }
+    }
+
+    case "WN_DATA_CREATE_TASK": {
+      try {
+        const res = await windayData.createTask({
+          workspace_id: msg.workspaceId,
+          title: msg.title,
+          description: msg.description || null,
+        });
+        const sent = await store.markTaskSent(msg.key, {
+          workspaceId: res.workspace?.id || msg.workspaceId,
+          workspaceName: res.workspace?.name || msg.workspaceName || null,
+          taskId: res.task?.id || null,
+        });
+        await store.setLastTaskWorkspace(msg.workspaceId);
+        return { ok: true, sent };
+      } catch (e) {
+        return dataError(e);
+      }
+    }
+
+    case "WN_DATA_DISCONNECT":
+      await windayData.disconnect();
+      return { ok: true };
 
     // Latest persisted session, for contexts without chrome.storage (offscreen).
     case "WN_GET_SESSION":
@@ -747,3 +792,21 @@ function boot() {
 chrome.runtime.onInstalled.addListener(boot);
 chrome.runtime.onStartup.addListener(boot);
 boot();
+
+// --- Winday Data helpers ----------------------------------------------------
+
+/** The workspaces a step can go to, the one used last first. */
+async function windayWorkspaces() {
+  const [res, last] = await Promise.all([windayData.listWorkspaces(), store.getLastTaskWorkspace()]);
+  const workspaces = (res.workspaces || []).slice().sort((a, b) => (b.id === last) - (a.id === last));
+  return { tasksEnabled: res.tasks_enabled === true, workspaces, lastWorkspaceId: last };
+}
+
+/** A Winday Data failure, as the panel shows it: its code, and a sentence. */
+function dataError(e) {
+  return {
+    ok: false,
+    code: e?.code || "error",
+    error: String(e?.message || e || "Winday Data could not be reached."),
+  };
+}

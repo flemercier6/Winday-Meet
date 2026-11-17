@@ -190,6 +190,23 @@ it `transcript.txt` and the AI headline is used instead.
   still created in the CRM, just without the pre‑resolved company link. The
   `upcoming-meetings` function is available server‑side for a follow‑up.
 
+### Next steps → Winday Data tasks
+
+Hover a **next step** in a call's summary: a button with Winday's mark appears
+on the right. It puts the step on your **Tasks** list in a **Winday Data**
+workspace you pick — the task's title is the step, its description names the
+call, its date, the company, the owner and the CRM meeting link, so the AI that
+later works the task knows where it came from. A step already sent keeps its
+mark, ticked, with the workspace it went to.
+
+Winday Data is a separate app with its own accounts. The first click asks you
+to **Connect Winday Data**: its consent screen opens (OAuth with PKCE, the
+same server AI assistants connect to) and grants the extension **your
+workspaces and your Tasks list only** — scope `tasks`, none of your ad data.
+Revoke it any time in Winday Data ▸ Settings ▸ Winday MCP, or with
+*Disconnect Winday Data* at the bottom of the menu. The connection lives in
+the service worker (`lib/winday-data.js`, needs the `identity` permission).
+
 ---
 
 ## Backend
@@ -231,7 +248,8 @@ options/               settings: mic permission, Notion db, models, prompt
 lib/supabase.js        auth / storage / Edge Function REST client
 lib/pipeline.js        upload → transcribe → summarize → export orchestration
 lib/transcript-import.js  parses a pasted-in transcript file into utterances
-lib/store.js           chrome.storage: session, settings, meetings cache
+lib/store.js           chrome.storage: session, settings, meetings cache, steps sent
+lib/winday-data.js     Winday Data OAuth link + Tasks API (service worker only)
 icons/                 prebuilt PNG icons (+ generator)
 supabase/              shared Edge Functions (reference; already deployed)
 ```

@@ -338,7 +338,7 @@ function renderSummaryFor(m) {
       const owner = span("owner-pill " + (isUser(ns) ? "user" : "other"));
       owner.textContent = ns.owner || (isUser(ns) ? "You" : "Participant");
       const task = span("todo-task"); task.textContent = ns.task;
-      item.append(cb, owner, task);
+      item.append(cb, owner, task, sendStepCell(m, ns));
       list.append(item);
     }
     s.append(h, list); box.append(s);
@@ -378,6 +378,196 @@ function renderSummaryFor(m) {
   if (notion) links.append(linkA("Open in Notion", notion, "notion-open")); // Notion only if exported
   links.append(linkA("Open in CRM", crmURL(m || { id: state.meetingId }), "crm-open"));
   box.append(links);
+}
+
+// --- Next steps → Winday Data tasks --------------------------------------
+// Each next step carries, on hover, a button with Winday's mark: it puts the
+// step on the user's Tasks list in a Winday Data workspace they pick. The
+// service worker holds the Winday Data connection (lib/winday-data.js); a
+// step already sent keeps its mark, ticked, with where it went.
+
+let sentTasks = {};
+store.getSentTasks().then((v) => { sentTasks = v || {}; repaintSentButtons(); }).catch(() => {});
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.wn_sent_tasks) {
+    sentTasks = changes.wn_sent_tasks.newValue || {};
+    repaintSentButtons();
+  }
+});
+
+// The buttons on screen, by step key, to tick the one just sent.
+const sendButtons = new Map();
+function repaintSentButtons() {
+  for (const [key, b] of sendButtons) {
+    if (b.isConnected) paintSendButton(b, sentTasks[key]);
+    else sendButtons.delete(key);
+  }
+}
+
+function paintSendButton(b, sent) {
+  b.replaceChildren(icon("winday", 14));
+  if (sent) {
+    const tick = span("send-tick");
+    tick.append(icon("check", 11));
+    b.append(tick);
+  }
+  b.classList.toggle("sent", !!sent);
+  const label = sent
+    ? `Added to ${sent.workspaceName || "Winday Data"} — add it to another workspace`
+    : "Add as a task in Winday Data";
+  b.title = label;
+  b.setAttribute("aria-label", label);
+}
+
+/** A next step as a Winday Data task: its text as the title, the call it came from in the description. */
+function taskFromStep(m, ns, isUserStep) {
+  const full = String(ns.task || "").replace(/\s+/g, " ").trim();
+  const title = full.length <= 200 ? full : full.slice(0, 199).replace(/\s+\S*$/, "") + "…";
+  const lines = [];
+  if (title !== full) lines.push(full, "");
+  const when = m && m.startedAt
+    ? new Date(m.startedAt).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" })
+    : null;
+  const company = m && m.calendar && m.calendar.companyName;
+  const call = (m && m.title) || "a call";
+  lines.push(`Next step from the call "${call}"${when ? ` on ${when}` : ""}${company ? ` with ${company}` : ""}.`);
+  lines.push(`Owner: ${ns.owner || (isUserStep ? "You" : "Participant")}.`);
+  if (m && m.id) lines.push(`Call notes: ${crmURL(m)} (Winday CRM meeting ${m.id}).`);
+  return { title, description: lines.join("\n") };
+}
+
+function sendStepCell(m, ns) {
+  const cell = span("todo-send");
+  const key = store.sentTaskKey(m && m.id, ns.task);
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "send-task";
+  paintSendButton(b, sentTasks[key]);
+  sendButtons.set(key, b);
+  b.addEventListener("click", (e) => {
+    // Inside the step's <label>: never tick its checkbox.
+    e.preventDefault();
+    e.stopPropagation();
+    toggleStepMenu(cell, b, m, ns, key);
+  });
+  cell.append(b);
+  return cell;
+}
+
+function toggleStepMenu(cell, b, m, ns, key) {
+  const wasOurs = openMenu && openMenu._btn === b;
+  closeMenu();
+  if (wasOurs) return;
+  const menu = div("row-menu task-menu");
+  menu._btn = b;
+  // Clicks inside the menu stay in it: the step's <label> would take them.
+  menu.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); });
+  const head = div("task-menu-head");
+  head.textContent = sentTasks[key] ? `Added to ${sentTasks[key].workspaceName || "Winday Data"}` : "Add to Winday Data";
+  const body = div("task-menu-body");
+  menu.append(head, body);
+  cell.append(menu);
+  openMenu = menu;
+  b.classList.add("open");
+  fillStepMenu(menu, body, b, m, ns, key);
+}
+
+function menuNote(textContent, cls = "task-menu-note") {
+  const n = div(cls);
+  n.textContent = textContent;
+  return n;
+}
+
+function menuAction(label, onClick, cls = "") {
+  const a = document.createElement("button");
+  a.type = "button";
+  a.className = cls;
+  a.textContent = label;
+  a.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); onClick(a); });
+  return a;
+}
+
+async function fillStepMenu(menu, body, b, m, ns, key) {
+  body.replaceChildren(menuNote("Loading your workspaces…"));
+  let r;
+  try {
+    r = await chrome.runtime.sendMessage({ type: "WN_DATA_WORKSPACES" });
+  } catch (e) {
+    r = { ok: false, error: String(e && e.message || e) };
+  }
+  if (openMenu !== menu) return; // closed meanwhile
+
+  if (!r || !r.ok) {
+    if (r && r.code === "not_connected") {
+      body.replaceChildren(
+        menuNote("Connect Winday Data to send this call's next steps to your Tasks list. It only gets access to your workspaces and tasks."),
+        menuAction("Connect Winday Data", async (a) => {
+          a.disabled = true;
+          a.textContent = "Waiting for Winday Data…";
+          const c = await chrome.runtime.sendMessage({ type: "WN_DATA_CONNECT" }).catch((e) => ({ ok: false, error: String(e) }));
+          if (openMenu !== menu) return;
+          if (c && c.ok) fillStepMenu(menu, body, b, m, ns, key);
+          else {
+            a.disabled = false;
+            a.textContent = "Connect Winday Data";
+            body.prepend(menuNote((c && c.error) || "Could not connect.", "task-menu-error"));
+          }
+        }, "primary-action"),
+      );
+      return;
+    }
+    body.replaceChildren(
+      menuNote((r && r.error) || "Winday Data could not be reached.", "task-menu-error"),
+      menuAction("Try again", () => fillStepMenu(menu, body, b, m, ns, key)),
+    );
+    return;
+  }
+
+  if (!r.tasksEnabled) {
+    body.replaceChildren(menuNote("Tasks is not available on your Winday Data account yet."));
+    return;
+  }
+  const usable = (r.workspaces || []).filter((w) => w.can_add_tasks);
+  if (!usable.length) {
+    body.replaceChildren(menuNote("You don't edit any Winday Data workspace yet."));
+    return;
+  }
+
+  const list = div("task-menu-list");
+  for (const w of usable) {
+    const label = w.id === (sentTasks[key] && sentTasks[key].workspaceId) ? `${w.name} ✓` : w.name;
+    list.append(menuAction(label, (a) => createStepTask(menu, body, a, b, m, ns, key, w)));
+  }
+  const foot = div("task-menu-foot");
+  foot.append(menuAction("Disconnect Winday Data", async () => {
+    await chrome.runtime.sendMessage({ type: "WN_DATA_DISCONNECT" }).catch(() => {});
+    if (openMenu === menu) fillStepMenu(menu, body, b, m, ns, key);
+  }, "foot-action"));
+  body.replaceChildren(list, foot);
+}
+
+async function createStepTask(menu, body, a, b, m, ns, key, w) {
+  for (const other of body.querySelectorAll("button")) other.disabled = true;
+  a.textContent = `Adding to ${w.name}…`;
+  const isUserStep = ns.is_user === true || ns.owner === "You";
+  const { title, description } = taskFromStep(m, ns, isUserStep);
+  const r = await chrome.runtime
+    .sendMessage({ type: "WN_DATA_CREATE_TASK", key, workspaceId: w.id, workspaceName: w.name, title, description })
+    .catch((e) => ({ ok: false, error: String(e) }));
+  if (r && r.ok) {
+    sentTasks = { ...sentTasks, [key]: r.sent };
+    paintSendButton(b, r.sent);
+    if (openMenu === menu) {
+      body.replaceChildren(menuNote(`Added to ${w.name}'s Tasks in Winday Data.`, "task-menu-done"));
+      setTimeout(() => { if (openMenu === menu) closeMenu(); }, 1400);
+    }
+    return;
+  }
+  if (openMenu !== menu) return;
+  if (r && r.code === "not_connected") return fillStepMenu(menu, body, b, m, ns, key);
+  for (const other of body.querySelectorAll("button")) other.disabled = false;
+  a.textContent = w.name;
+  body.prepend(menuNote((r && r.error) || "The task could not be added.", "task-menu-error"));
 }
 
 // --- Bottom bar ----------------------------------------------------------
@@ -504,7 +694,11 @@ function itemRow(m) {
 // or Escape closes it.
 let openMenu = null;
 function closeMenu() {
-  if (openMenu) { openMenu.remove(); openMenu = null; }
+  if (openMenu) {
+    if (openMenu._btn) openMenu._btn.classList.remove("open");
+    openMenu.remove();
+    openMenu = null;
+  }
 }
 document.addEventListener("click", (e) => {
   if (openMenu && !openMenu.contains(e.target) && !openMenu._btn.contains(e.target)) closeMenu();
